@@ -467,6 +467,8 @@ pub struct PrismPackageVersionDetail {
     pub maven_files: Vec<PrismLibrary>,
     #[serde(rename = "minecraftArguments")]
     pub minecraft_arguments: Option<String>,
+    #[serde(rename = "+tweakers", default)]
+    pub tweakers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -682,12 +684,22 @@ fn loader_metadata_from_prism(
             })
             .collect(),
         jvm_arguments: Vec::new(),
-        game_arguments: detail
-            .minecraft_arguments
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(ToString::to_string)
-            .collect(),
+        game_arguments: {
+            let mut game_arguments: Vec<String> = detail
+                .minecraft_arguments
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(ToString::to_string)
+                .collect();
+            // Legacy LaunchWrapper era (Forge <=1.12.2): Prism carries the FML
+            // tweaker in `+tweakers`. Without `--tweakClass` LaunchWrapper falls
+            // back to VanillaTweaker and dies with CNFE net.minecraft.client.Minecraft.
+            for tweaker in &detail.tweakers {
+                game_arguments.push("--tweakClass".to_string());
+                game_arguments.push(tweaker.clone());
+            }
+            game_arguments
+        },
         min_java_version: None,
     }
 }
@@ -971,5 +983,40 @@ mod tests {
         assert!(metadata
             .game_arguments
             .contains(&"1.21.1".to_string()));
+    }
+
+    fn prism_legacy_forge_detail_json() -> &'static str {
+        // Shape mirrors live Prism meta for net.minecraftforge/14.23.5.2864.json:
+        // LaunchWrapper era, no minecraftArguments, FML tweaker in +tweakers.
+        r#"{
+          "mainClass": "net.minecraft.launchwrapper.Launch",
+          "+tweakers": ["net.minecraftforge.fml.common.launcher.FMLTweaker"],
+          "libraries": [
+            {
+              "name": "net.minecraftforge:forge:1.12.2-14.23.5.2864:universal"
+            }
+          ]
+        }"#
+    }
+
+    #[test]
+    fn converts_prism_legacy_forge_detail_emits_tweak_class() {
+        let detail: PrismPackageVersionDetail =
+            serde_json::from_str(prism_legacy_forge_detail_json()).unwrap();
+        let metadata =
+            loader_metadata_from_prism(ModLoader::Forge, "1.12.2", "14.23.5.2864".into(), detail);
+
+        // Legacy Forge uses LaunchWrapper; the FML tweaker must be passed via
+        // --tweakClass or LaunchWrapper falls back to VanillaTweaker and dies.
+        assert_eq!(metadata.main_class, "net.minecraft.launchwrapper.Launch");
+        let tweak_index = metadata
+            .game_arguments
+            .iter()
+            .position(|arg| arg == "--tweakClass")
+            .expect("legacy Forge must emit --tweakClass");
+        assert_eq!(
+            metadata.game_arguments[tweak_index + 1],
+            "net.minecraftforge.fml.common.launcher.FMLTweaker"
+        );
     }
 }
