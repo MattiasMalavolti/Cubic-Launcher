@@ -414,3 +414,14 @@ function patchModNames() {
     return nameFixed;
   }));
 }
+
+/**
+ * Seed the readable-name cache from a name the UI already knows (e.g. the
+ * add-mod dialog result) so cards never regress to showing the raw Modrinth
+ * project ID when the metadata fetch is unavailable.
+ */
+export function seedModName(id: string, name: string) {
+  if (!id || !name || name === id) return;
+  modNameCache.set(id, name);
+  patchModNames();
+}

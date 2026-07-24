@@ -12,7 +12,7 @@ import {
   XIcon,
 } from "../icons";
 
-export { bumpContentVersion } from "./use-content-tab-state";
+export { bumpContentVersion, seedContentName } from "./use-content-tab-state";
 
 export function ContentTabView(props: ContentTabViewProps) {
   const state = useContentTabState(props);
