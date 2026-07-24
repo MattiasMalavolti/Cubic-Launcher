@@ -178,6 +178,24 @@ pub(super) fn forge_wrapper_installer_artifact(
                 "NeoForge metadata did not include a loader version"
             );
 
+            // NeoForge 1.20.1 (the 47.x fork era) still publishes under the
+            // inherited `net.neoforged:forge` coordinate with an MC-prefixed
+            // version (`1.20.1-47.1.106`). 1.20.2+ (20.2.x / 21.x) switched to
+            // `net.neoforged:neoforge` with a bare loader version.
+            if loader_metadata.minecraft_version == "1.20.1" {
+                let coord = format!("1.20.1-{version}");
+                return Ok(Some(ForgeWrapperInstallerArtifact {
+                    url: format!(
+                        "https://maven.neoforged.net/releases/net/neoforged/forge/{coord}/forge-{coord}-installer.jar"
+                    ),
+                    relative_path: PathBuf::from("net")
+                        .join("neoforged")
+                        .join("forge")
+                        .join(&coord)
+                        .join(format!("forge-{coord}-installer.jar")),
+                }));
+            }
+
             Ok(Some(ForgeWrapperInstallerArtifact {
                 url: format!(
                     "https://maven.neoforged.net/releases/net/neoforged/neoforge/{version}/neoforge-{version}-installer.jar"

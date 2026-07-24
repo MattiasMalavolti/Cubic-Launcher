@@ -215,6 +215,36 @@ fn forge_wrapper_installer_artifact_uses_loader_specific_maven_path() {
 }
 
 #[test]
+fn forge_wrapper_installer_artifact_neoforge_1_20_1_uses_forge_coordinate() {
+    // NeoForge 1.20.1 (47.x fork era) publishes under net.neoforged:forge with
+    // an MC-prefixed version, unlike 1.20.2+ which uses net.neoforged:neoforge.
+    let metadata = LoaderMetadata {
+        mod_loader: ModLoader::NeoForge,
+        minecraft_version: "1.20.1".into(),
+        loader_version: "47.1.106".into(),
+        main_class: "io.github.zekerzhayard.forgewrapper.installer.Main".into(),
+        libraries: Vec::new(),
+        maven_files: Vec::new(),
+        jvm_arguments: Vec::new(),
+        game_arguments: Vec::new(),
+        min_java_version: None,
+    };
+
+    let artifact = forge_wrapper_installer_artifact(&metadata)
+        .unwrap()
+        .expect("NeoForge 1.20.1 should require an installer artifact");
+
+    assert_eq!(
+        artifact.url,
+        "https://maven.neoforged.net/releases/net/neoforged/forge/1.20.1-47.1.106/forge-1.20.1-47.1.106-installer.jar"
+    );
+    assert_eq!(
+        artifact.relative_path,
+        PathBuf::from("net/neoforged/forge/1.20.1-47.1.106/forge-1.20.1-47.1.106-installer.jar")
+    );
+}
+
+#[test]
 fn forge_wrapper_installer_artifact_can_use_prism_maven_files() {
     let metadata = LoaderMetadata {
         mod_loader: ModLoader::Forge,
