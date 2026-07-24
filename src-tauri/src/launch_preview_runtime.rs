@@ -31,6 +31,10 @@ use super::{
     LaunchPlaceholders, LoggingProcessEventSink, PlayerIdentity, StartedLaunch, ACTIVE_MC_PID,
 };
 
+/// Main class of the modern ForgeWrapper installer (Forge 1.13+ and NeoForge).
+/// Legacy Forge (<=1.12.2) instead uses `net.minecraft.launchwrapper.Launch`.
+const FORGE_WRAPPER_MAIN_CLASS: &str = "io.github.zekerzhayard.forgewrapper.installer.Main";
+
 pub(super) async fn materialize_loader_libraries(
     http_client: &reqwest::Client,
     library_root: &Path,
@@ -142,6 +146,12 @@ pub(super) struct ForgeWrapperInstallerArtifact {
 pub(super) fn forge_wrapper_installer_artifact(
     loader_metadata: &LoaderMetadata,
 ) -> Result<Option<ForgeWrapperInstallerArtifact>> {
+    // Legacy Forge (<=1.12.2) launches via LaunchWrapper (main class
+    // net.minecraft.launchwrapper.Launch) with a --tweakClass, NOT ForgeWrapper.
+    // Only prepare the wrapper installer for the modern ForgeWrapper main class.
+    if loader_metadata.main_class != FORGE_WRAPPER_MAIN_CLASS {
+        return Ok(None);
+    }
     match loader_metadata.mod_loader {
         ModLoader::Forge => {
             let version = loader_metadata
@@ -997,6 +1007,8 @@ pub(super) fn substitute_known_placeholders(
             "${assets_index_name}",
             placeholders.assets_index_name.as_str(),
         ),
+        ("${game_assets}", placeholders.game_assets.as_str()),
+        ("${auth_session}", placeholders.auth_access_token.as_str()),
         ("${auth_uuid}", placeholders.auth_uuid.as_str()),
         (
             "${auth_access_token}",
