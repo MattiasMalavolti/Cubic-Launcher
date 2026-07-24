@@ -618,7 +618,8 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
 
     if target.mod_loader == ModLoader::Vanilla {
         loader_metadata.main_class = mc_data.main_class.clone();
-        loader_metadata.jvm_arguments = mc_data.jvm_arguments.clone();
+        loader_metadata.jvm_arguments =
+            merge_minecraft_and_loader_jvm_arguments(&mc_data.jvm_arguments, Vec::new());
         loader_metadata.game_arguments = mc_data.game_arguments.clone();
     } else {
         // For modded loaders (Fabric, Forge, etc.): prepend essential MC game
@@ -662,6 +663,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &mc_data.asset_index_id,
         &instance_library_dir,
         &instance_natives_dir,
+        mc_data.is_virtual_assets,
     );
     substitute_loader_placeholders(&mut loader_metadata, &placeholders);
 

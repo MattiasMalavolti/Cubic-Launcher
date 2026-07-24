@@ -90,6 +90,9 @@ pub(super) struct LaunchPlaceholders {
     pub(super) game_directory: String,
     pub(super) assets_root: String,
     pub(super) assets_index_name: String,
+    /// Legacy `--assetsDir` target: the materialized virtual tree for pre-1.7.3
+    /// versions, otherwise the shared assets root.
+    pub(super) game_assets: String,
     pub(super) auth_uuid: String,
     pub(super) auth_access_token: String,
     pub(super) user_type: String,
@@ -183,6 +186,7 @@ impl LaunchPlaceholders {
         asset_index_id: &str,
         library_directory: &Path,
         natives_directory: &Path,
+        is_virtual_assets: bool,
     ) -> Self {
         Self {
             auth_player_name: player_identity.username.clone(),
@@ -195,6 +199,15 @@ impl LaunchPlaceholders {
             game_directory: game_directory.display().to_string(),
             assets_root: assets_root.display().to_string(),
             assets_index_name: asset_index_id.to_string(),
+            game_assets: if is_virtual_assets {
+                assets_root
+                    .join("virtual")
+                    .join(asset_index_id)
+                    .display()
+                    .to_string()
+            } else {
+                assets_root.display().to_string()
+            },
             auth_uuid: player_identity.uuid.clone(),
             auth_access_token: player_identity.access_token.clone(),
             user_type: player_identity.user_type.clone(),

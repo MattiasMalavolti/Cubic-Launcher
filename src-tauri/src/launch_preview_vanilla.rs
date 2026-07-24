@@ -16,9 +16,9 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
     build_instance_root, emit_log, emit_progress, filter_minecraft_launch_game_arguments,
-    load_player_identity, select_or_download_java, spawn_minecraft_process,
-    substitute_loader_placeholders, EffectiveLaunchSettings, LaunchLogSession, LaunchPlaceholders,
-    SelectedMod, StartedLaunch,
+    load_player_identity, merge_minecraft_and_loader_jvm_arguments, select_or_download_java,
+    spawn_minecraft_process, substitute_loader_placeholders, EffectiveLaunchSettings,
+    LaunchLogSession, LaunchPlaceholders, SelectedMod, StartedLaunch,
 };
 
 pub(super) async fn run_vanilla_launch_pipeline(
@@ -122,7 +122,8 @@ pub(super) async fn run_vanilla_launch_pipeline(
         .fetch_loader_metadata(&target.minecraft_version, ModLoader::Vanilla)
         .await?;
     loader_metadata.main_class = mc_data.main_class.clone();
-    loader_metadata.jvm_arguments = mc_data.jvm_arguments.clone();
+    loader_metadata.jvm_arguments =
+        merge_minecraft_and_loader_jvm_arguments(&mc_data.jvm_arguments, Vec::new());
     loader_metadata.game_arguments =
         filter_minecraft_launch_game_arguments(&mc_data.game_arguments);
 
@@ -154,6 +155,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
         &mc_data.asset_index_id,
         &instance_library_dir,
         &instance_natives_dir,
+        mc_data.is_virtual_assets,
     );
     substitute_loader_placeholders(&mut loader_metadata, &placeholders);
 
