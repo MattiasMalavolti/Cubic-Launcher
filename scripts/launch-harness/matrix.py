@@ -35,14 +35,19 @@ class MatrixVersion:
 
 # Stratum A — boundary versions for CI.
 STRATUM_A: list[MatrixVersion] = [
+    MatrixVersion("1.6.4", "ci", "oldest legacy: LWJGL2 natives + virtual/legacy asset index",
+                  loaders=("vanilla",)),
     MatrixVersion("1.12.2", "ci", "last legacy minecraftArguments + Java 8; wrapper legacy (Forge)",
                   loaders=("vanilla", "forge")),
     MatrixVersion("1.13.2", "ci", "first modern arguments.game/jvm; Fabric negative side handled as fixture",
                   loaders=("vanilla", "forge")),
     MatrixVersion("1.14.4", "ci", "first Fabric-supported side", loaders=("vanilla", "fabric", "forge")),
-    MatrixVersion("1.16.5", "ci", "last Java 8 band"),
-    MatrixVersion("1.17.1", "ci", "Java 8->16 boundary"),
-    MatrixVersion("1.18.2", "ci", "Java 16->17 boundary"),
+    MatrixVersion("1.16.5", "ci", "last Java 8 band; NeoForge negative side handled as fixture",
+                  loaders=("vanilla", "fabric", "forge")),
+    MatrixVersion("1.17.1", "ci", "Java 8->16 boundary; NeoForge negative side handled as fixture",
+                  loaders=("vanilla", "fabric", "forge")),
+    MatrixVersion("1.18.2", "ci", "Java 16->17 boundary; NeoForge negative side handled as fixture",
+                  loaders=("vanilla", "fabric", "forge")),
     MatrixVersion("1.19.4", "ci", "NeoForge negative side handled as fixture",
                   loaders=("vanilla", "fabric", "forge")),
     MatrixVersion("1.20.1", "ci", "first NeoForge-supported side (net.neoforged Prism + installer)"),
@@ -52,8 +57,10 @@ STRATUM_A: list[MatrixVersion] = [
 
 # Stratum B — same code path as their band; local full sweep only.
 STRATUM_B: list[MatrixVersion] = [
-    MatrixVersion("1.15.2", "local", "modern args / Java 8 band"),
-    MatrixVersion("1.19.2", "local", "modern args / Java 17 band"),
+    MatrixVersion("1.15.2", "local", "modern args / Java 8 band; NeoForge negative side handled as fixture",
+                  loaders=("vanilla", "fabric", "forge")),
+    MatrixVersion("1.19.2", "local", "modern args / Java 17 band; NeoForge negative side handled as fixture",
+                  loaders=("vanilla", "fabric", "forge")),
     MatrixVersion("1.20.6", "local", "Java 21 band"),
     MatrixVersion("1.21.1", "local", "Java 21 / 1.21 band"),
     MatrixVersion("1.21.4", "local", "Java 21 / 1.21 band"),
@@ -73,10 +80,18 @@ class NegativeFixture:
 
 # Expected-incompatibility fixtures: PASS == the launch fails as expected.
 NEGATIVE_FIXTURES: list[NegativeFixture] = [
-    NegativeFixture("vanilla", "1.6.4", "launch_failed",
-                    "asset-index legacy format; parser requires assetIndex, no legacy branch"),
     NegativeFixture("fabric", "1.13.2", "launch_failed",
                     "Fabric not available before 1.14 -> metadata fetch fails"),
+    NegativeFixture("neoforge", "1.15.2", "launch_failed",
+                    "NeoForge not available before 1.20.1 -> metadata fetch fails"),
+    NegativeFixture("neoforge", "1.16.5", "launch_failed",
+                    "NeoForge not available before 1.20.1 -> metadata fetch fails"),
+    NegativeFixture("neoforge", "1.17.1", "launch_failed",
+                    "NeoForge not available before 1.20.1 -> metadata fetch fails"),
+    NegativeFixture("neoforge", "1.18.2", "launch_failed",
+                    "NeoForge not available before 1.20.1 -> metadata fetch fails"),
+    NegativeFixture("neoforge", "1.19.2", "launch_failed",
+                    "NeoForge not available before 1.20.1 -> metadata fetch fails"),
     NegativeFixture("neoforge", "1.19.4", "launch_failed",
                     "NeoForge not available before 1.20.1 -> metadata fetch fails"),
 ]
