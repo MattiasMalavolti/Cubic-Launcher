@@ -314,16 +314,55 @@ fn known_launch_placeholders_are_substituted() {
         "1.21",
         PathBuf::from("libraries-root").as_path(),
         PathBuf::from("natives-root").as_path(),
+        false,
     );
 
     let substituted = substitute_known_placeholders(
-        "${auth_player_name}:${auth_uuid}:${game_directory}:${version_name}:${resolution_width}x${resolution_height}",
+        "${auth_player_name}:${auth_uuid}:${game_directory}:${version_name}:${resolution_width}x${resolution_height}:${game_assets}",
         &placeholders,
     );
 
     assert_eq!(
         substituted,
-        "PlayerOne:uuid-123:game-dir:Pack-1.21.1-fabric:854x480"
+        "PlayerOne:uuid-123:game-dir:Pack-1.21.1-fabric:854x480:assets-root"
+    );
+}
+
+#[test]
+fn legacy_virtual_assets_redirect_game_assets_and_session() {
+    let placeholders = LaunchPlaceholders::new(
+        &PlayerIdentity {
+            username: "PlayerOne".into(),
+            uuid: "uuid-123".into(),
+            access_token: "token-abc".into(),
+            user_type: "offline".into(),
+            version_type: "Cubic".into(),
+        },
+        "Pack",
+        &ResolutionTarget {
+            minecraft_version: "1.6.4".into(),
+            mod_loader: ModLoader::Vanilla,
+        },
+        PathBuf::from("game-dir").as_path(),
+        PathBuf::from("assets-root").as_path(),
+        "legacy",
+        PathBuf::from("libraries-root").as_path(),
+        PathBuf::from("natives-root").as_path(),
+        true,
+    );
+
+    // Legacy: --assetsDir ${game_assets} must point at the materialized virtual
+    // tree, and --session ${auth_session} maps to the access token.
+    let substituted = substitute_known_placeholders(
+        "--assetsDir ${game_assets} --session ${auth_session}",
+        &placeholders,
+    );
+    assert_eq!(
+        substituted,
+        format!(
+            "--assetsDir {} --session token-abc",
+            PathBuf::from("assets-root").join("virtual").join("legacy").display()
+        )
     );
 }
 
@@ -421,6 +460,18 @@ fn modded_jvm_args_keep_natives_and_drop_minecraft_classpath_placeholder() {
             "-Dorg.lwjgl.librarypath=${natives_directory}".to_string(),
         ]
     );
+}
+
+#[test]
+fn legacy_vanilla_jvm_args_gain_natives_path_when_absent() {
+    // Legacy versions (<=1.12.x) use the `minecraftArguments` string, so the
+    // downloader yields an EMPTY jvm-args vec (no arguments.jvm block). Without
+    // injecting -Djava.library.path the LWJGL2 loader fails with
+    // "UnsatisfiedLinkError: no lwjgl(64) in java.library.path".
+    let merged = merge_minecraft_and_loader_jvm_arguments(&[], Vec::new());
+
+    assert!(merged.contains(&"-Djava.library.path=${natives_directory}".to_string()));
+    assert!(merged.contains(&"-Dorg.lwjgl.librarypath=${natives_directory}".to_string()));
 }
 
 #[test]
