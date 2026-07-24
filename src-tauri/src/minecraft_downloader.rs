@@ -8,7 +8,7 @@ use tauri::{Emitter, State};
 use tokio::task::JoinSet;
 
 use crate::launcher_paths::LauncherPaths;
-use crate::path_safety::contained_join;
+use crate::path_safety::{contained_join, validate_path_component};
 use crate::process_streaming::{ProcessLogEvent, ProcessLogStream, MINECRAFT_LOG_EVENT};
 
 const VERSION_MANIFEST_URL: &str =
@@ -32,6 +32,9 @@ pub struct MinecraftVersionData {
     pub assets_dir: PathBuf,
     /// Asset index ID (e.g. `"17"` for MC 1.21.x).
     pub asset_index_id: String,
+    /// True for legacy "virtual" asset indexes (<=1.7.2): assets are
+    /// materialized under `assets/virtual/<id>/` and `--assetsDir` points there.
+    pub is_virtual_assets: bool,
     /// Standard game arguments with `${placeholder}` tokens still present.
     pub game_arguments: Vec<String>,
     /// JVM arguments (filtered by the current OS), with `${placeholder}` tokens.
@@ -151,11 +154,20 @@ struct AssetIndexRef {
 #[derive(Deserialize)]
 struct AssetIndexJson {
     objects: HashMap<String, AssetObject>,
+    #[serde(default, rename = "virtual")]
+    is_virtual: bool,
 }
 
 #[derive(Deserialize)]
 struct AssetObject {
     hash: String,
+}
+
+fn asset_hash_prefix(hash: &str) -> Result<&str> {
+    if hash.len() != 40 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid asset SHA-1 '{hash}'");
+    }
+    Ok(&hash[..2])
 }
 
 // ── OS detection ──────────────────────────────────────────────────────────────
@@ -494,9 +506,18 @@ pub async fn ensure_minecraft_version(
     let (library_paths, native_paths) =
         ensure_libraries(http_client, &version_json, &libraries_dir, &on_progress).await?;
 
-    // 5. Ensure assets.
+    // 5. Ensure assets. Legacy indexes (<=1.7.2) are "virtual": the game reads
+    //    real filenames from a materialized tree rather than the hashed object
+    //    store, so we must copy them out and point --assetsDir there.
     on_progress("Ensure assets", minecraft_version);
-    ensure_assets(http_client, &version_json, &assets_dir, &on_progress).await?;
+    let is_virtual_assets = ensure_assets(
+        http_client,
+        &version_json,
+        &assets_dir,
+        &version_json.assets,
+        &on_progress,
+    )
+    .await?;
 
     // 6. Extract arguments.
     let (game_arguments, jvm_arguments) = extract_arguments(&version_json);
@@ -508,6 +529,7 @@ pub async fn ensure_minecraft_version(
         native_paths,
         assets_dir,
         asset_index_id: version_json.assets,
+        is_virtual_assets,
         game_arguments,
         jvm_arguments,
     })
@@ -641,8 +663,9 @@ async fn ensure_assets(
     client: &reqwest::Client,
     version_json: &VersionJson,
     assets_dir: &Path,
+    asset_index_id: &str,
     on_progress: &impl Fn(&str, &str),
-) -> Result<()> {
+) -> Result<bool> {
     let indexes_dir = assets_dir.join("indexes");
     let objects_dir = assets_dir.join("objects");
     std::fs::create_dir_all(&indexes_dir)
@@ -660,6 +683,7 @@ async fn ensure_assets(
         .with_context(|| format!("failed to read asset index {}", index_path.display()))?;
     let asset_index: AssetIndexJson = serde_json::from_str(&index_contents)
         .with_context(|| format!("failed to parse asset index {}", index_path.display()))?;
+    let is_virtual = asset_index.is_virtual;
 
     // Count how many assets need downloading.
     let to_download: Vec<String> = asset_index
@@ -667,7 +691,7 @@ async fn ensure_assets(
         .values()
         .map(|obj| {
             let hash = &obj.hash;
-            let prefix = &hash[..2];
+            let prefix = asset_hash_prefix(hash)?;
             let dest = contained_join(objects_dir.as_path(), &format!("{prefix}/{hash}"))?;
             Ok((hash.clone(), dest))
         })
@@ -676,45 +700,85 @@ async fn ensure_assets(
         .filter_map(|(hash, dest)| (!dest.exists()).then_some(hash))
         .collect();
 
-    if to_download.is_empty() {
-        return Ok(());
+    if !to_download.is_empty() {
+        on_progress(
+            "Downloading assets",
+            &format!("{} objects", to_download.len()),
+        );
+
+        // Download missing assets in parallel (up to 32 concurrent).
+        const CONCURRENCY: usize = 32;
+        let chunks: Vec<&[String]> = to_download.chunks(CONCURRENCY).collect();
+
+        for chunk in chunks {
+            let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+
+            for hash in chunk {
+                let hash = hash.clone();
+                let client = client.clone();
+                let objects_dir = objects_dir.clone();
+                let base_url = MC_ASSETS_BASE_URL;
+
+                join_set.spawn(async move {
+                    let prefix = asset_hash_prefix(&hash)?;
+                    let dest = contained_join(objects_dir.as_path(), &format!("{prefix}/{hash}"))?;
+                    if dest.exists() {
+                        return Ok(());
+                    }
+                    let url = format!("{}/{}/{}", base_url, prefix, hash);
+                    download_file(&client, &url, &dest).await
+                });
+            }
+
+            while let Some(result) = join_set.join_next().await {
+                result
+                    .context("asset download task panicked")?
+                    .context("asset download failed")?;
+            }
+        }
     }
 
-    on_progress(
-        "Downloading assets",
-        &format!("{} objects", to_download.len()),
-    );
+    // Legacy virtual indexes: materialize real filenames under
+    // assets/virtual/<id>/ so the game (which ignores the hashed store) can read
+    // them via --assetsDir. Copies are skipped when already present.
+    if is_virtual {
+        materialize_virtual_assets(&asset_index, &objects_dir, assets_dir, asset_index_id)?;
+    }
 
-    // Download missing assets in parallel (up to 32 concurrent).
-    const CONCURRENCY: usize = 32;
-    let chunks: Vec<&[String]> = to_download.chunks(CONCURRENCY).collect();
+    Ok(is_virtual)
+}
 
-    for chunk in chunks {
-        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+/// Copy hashed asset objects into `assets/virtual/<id>/<real/path>` for legacy
+/// ("virtual") indexes. Idempotent: existing up-to-date files are left alone.
+fn materialize_virtual_assets(
+    asset_index: &AssetIndexJson,
+    objects_dir: &Path,
+    assets_dir: &Path,
+    asset_index_id: &str,
+) -> Result<()> {
+    validate_path_component(asset_index_id)?;
+    let virtual_root = contained_join(assets_dir.join("virtual").as_path(), asset_index_id)?;
 
-        for hash in chunk {
-            let hash = hash.clone();
-            let client = client.clone();
-            let objects_dir = objects_dir.clone();
-            let base_url = MC_ASSETS_BASE_URL;
+    for (logical_path, object) in &asset_index.objects {
+        let hash = &object.hash;
+        let prefix = asset_hash_prefix(hash)?;
+        let source = contained_join(objects_dir, &format!("{prefix}/{hash}"))?;
+        let dest = contained_join(virtual_root.as_path(), logical_path)?;
 
-            join_set.spawn(async move {
-                let prefix = &hash[..2];
-                let dest =
-                    contained_join(objects_dir.as_path(), &format!("{prefix}/{hash}"))?;
-                if dest.exists() {
-                    return Ok(());
-                }
-                let url = format!("{}/{}/{}", base_url, prefix, hash);
-                download_file(&client, &url, &dest).await
-            });
+        if dest.exists() {
+            continue;
         }
-
-        while let Some(result) = join_set.join_next().await {
-            result
-                .context("asset download task panicked")?
-                .context("asset download failed")?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
+        std::fs::copy(&source, &dest).with_context(|| {
+            format!(
+                "failed to materialize virtual asset {} -> {}",
+                source.display(),
+                dest.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -820,6 +884,15 @@ mod tests {
             contained_join(libraries_dir, "org/example/library/1.0/library-1.0.jar").unwrap(),
             libraries_dir.join("org/example/library/1.0/library-1.0.jar")
         );
+    }
+
+    #[test]
+    fn asset_hash_prefix_requires_a_sha1() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(asset_hash_prefix(sha1).unwrap(), "01");
+        assert!(asset_hash_prefix("a").is_err());
+        assert!(asset_hash_prefix("../../outside").is_err());
+        assert!(asset_hash_prefix("g123456789abcdef0123456789abcdef01234567").is_err());
     }
 
     #[test]

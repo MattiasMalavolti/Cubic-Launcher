@@ -11,8 +11,7 @@ use sha2::{Digest, Sha256};
 
 const MICROSOFT_AUTHORIZE_URL: &str =
     "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize";
-const MICROSOFT_TOKEN_URL: &str =
-    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+const MICROSOFT_TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 const BUNDLED_MICROSOFT_CLIENT_ID: &str = "7dce88aa-79b0-4b77-9666-0fdb8addd50c";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,14 +225,6 @@ impl<'connection> AccountsRepository<'connection> {
         }
 
         transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn update_profile_data(&self, microsoft_id: &str, profile_data: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE accounts SET profile_data = ?1 WHERE microsoft_id = ?2",
-            params![profile_data, microsoft_id],
-        )?;
         Ok(())
     }
 
@@ -686,7 +677,6 @@ pub async fn run_microsoft_login(client_id: &str) -> Result<MinecraftLoginResult
 
 async fn serve_loopback_callback(listener: &tokio::net::TcpListener, port: u16) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 
     loop {
         let (mut stream, _) =

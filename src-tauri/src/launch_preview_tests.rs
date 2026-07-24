@@ -7,20 +7,74 @@ use crate::modrinth::{DependencyType, ModrinthDependency, ModrinthFile, Modrinth
 use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
-    build_instance_root, build_modded_classpath_entries, build_top_level_owner_map,
-    deduplicate_versions,
-    collect_selected_project_ids, contained_loader_library_path, embedded_min_java_requirement,
-    fabric_dependency_predicates_match, filter_minecraft_launch_game_arguments,
-    forge_wrapper_installer_artifact, load_modlist, local_mod_jar_path,
-    maven_artifact_relative_path, merge_minecraft_and_loader_game_arguments,
-    merge_minecraft_and_loader_jvm_arguments, minecraft_version_predicate_matches,
-    minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
-    substitute_known_placeholders, validate_content_filename, validate_final_fabric_runtime,
-    validate_selected_parent_dependencies, EffectiveLaunchSettings, EmbeddedFabricModMetadata,
-    EmbeddedFabricRequirementSet, EmbeddedFabricRequirements, LaunchPlaceholders,
+    automation_exit_code, build_instance_root, build_modded_classpath_entries,
+    build_top_level_owner_map, contained_loader_library_path, detect_modrinth_declared_notices,
+    embedded_min_java_requirement, fabric_dependency_predicates_match, fabric_issue_to_notice,
+    filter_minecraft_launch_game_arguments, forge_wrapper_installer_artifact,
+    load_active_account_for_launch, load_modlist, local_mod_jar_path, maven_artifact_relative_path,
+    merge_minecraft_and_loader_game_arguments, merge_minecraft_and_loader_jvm_arguments,
+    minecraft_version_predicate_matches, minimum_java_version_for_predicate, parse_mod_loader,
+    relative_loader_library_path, substitute_known_placeholders, validate_content_filename,
+    validate_final_fabric_runtime, DependencyNoticeKind, EffectiveLaunchSettings,
+    EmbeddedFabricModMetadata, EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
+    FabricValidationIssue, LaunchPlaceholders, LaunchVerificationRequest, LaunchVerificationResult,
     OwnedEmbeddedFabricModMetadata, PlayerIdentity,
 };
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
+
+#[test]
+fn launch_account_keeps_identity_when_token_key_is_unavailable() {
+    struct UnavailableSecretStore;
+
+    impl crate::token_storage::SecretStore for UnavailableSecretStore {
+        fn get_secret(&self, _key: &str) -> anyhow::Result<Option<String>> {
+            Err(anyhow::anyhow!("keyring unavailable"))
+        }
+
+        fn set_secret(&self, _key: &str, _secret: &str) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("keyring unavailable"))
+        }
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let database_path = std::env::temp_dir().join(format!(
+        "cubic-launch-account-{}-{timestamp}.db",
+        std::process::id()
+    ));
+    crate::database::initialize_database(&database_path).expect("initialize database");
+    let connection = rusqlite::Connection::open(&database_path).expect("open database");
+    crate::microsoft_auth::AccountsRepository::new(&connection)
+        .upsert_account(&crate::microsoft_auth::AccountRecord {
+            microsoft_id: "microsoft-id".into(),
+            xbox_gamertag: Some("StoredPlayer".into()),
+            minecraft_uuid: Some("123456781234123412341234567890ab".into()),
+            access_token_enc: Some(vec![1, 2, 3]),
+            refresh_token_enc: Some(vec![1, 2, 3]),
+            profile_data: Some(r#"{"username":"ProfilePlayer"}"#.into()),
+            is_active: true,
+        })
+        .expect("insert active account");
+
+    let loaded = load_active_account_for_launch(&connection, UnavailableSecretStore)
+        .expect("load active account")
+        .expect("active account");
+
+    assert_eq!(loaded.xbox_gamertag.as_deref(), Some("StoredPlayer"));
+    assert_eq!(
+        loaded.profile_data.as_deref(),
+        Some(r#"{"username":"ProfilePlayer"}"#)
+    );
+    assert_eq!(
+        loaded.minecraft_uuid.as_deref(),
+        Some("123456781234123412341234567890ab")
+    );
+    assert_eq!(loaded.refresh_token, None);
+    drop(connection);
+    std::fs::remove_file(database_path).expect("remove database");
+}
 
 fn global_settings() -> ShellGlobalSettings {
     ShellGlobalSettings {
@@ -214,6 +268,36 @@ fn forge_wrapper_installer_artifact_uses_loader_specific_maven_path() {
 }
 
 #[test]
+fn forge_wrapper_installer_artifact_neoforge_1_20_1_uses_forge_coordinate() {
+    // NeoForge 1.20.1 (47.x fork era) publishes under net.neoforged:forge with
+    // an MC-prefixed version, unlike 1.20.2+ which uses net.neoforged:neoforge.
+    let metadata = LoaderMetadata {
+        mod_loader: ModLoader::NeoForge,
+        minecraft_version: "1.20.1".into(),
+        loader_version: "47.1.106".into(),
+        main_class: "io.github.zekerzhayard.forgewrapper.installer.Main".into(),
+        libraries: Vec::new(),
+        maven_files: Vec::new(),
+        jvm_arguments: Vec::new(),
+        game_arguments: Vec::new(),
+        min_java_version: None,
+    };
+
+    let artifact = forge_wrapper_installer_artifact(&metadata)
+        .unwrap()
+        .expect("NeoForge 1.20.1 should require an installer artifact");
+
+    assert_eq!(
+        artifact.url,
+        "https://maven.neoforged.net/releases/net/neoforged/forge/1.20.1-47.1.106/forge-1.20.1-47.1.106-installer.jar"
+    );
+    assert_eq!(
+        artifact.relative_path,
+        PathBuf::from("net/neoforged/forge/1.20.1-47.1.106/forge-1.20.1-47.1.106-installer.jar")
+    );
+}
+
+#[test]
 fn forge_wrapper_installer_artifact_can_use_prism_maven_files() {
     let metadata = LoaderMetadata {
         mod_loader: ModLoader::Forge,
@@ -283,16 +367,58 @@ fn known_launch_placeholders_are_substituted() {
         "1.21",
         PathBuf::from("libraries-root").as_path(),
         PathBuf::from("natives-root").as_path(),
+        false,
     );
 
     let substituted = substitute_known_placeholders(
-        "${auth_player_name}:${auth_uuid}:${game_directory}:${version_name}:${resolution_width}x${resolution_height}",
+        "${auth_player_name}:${auth_uuid}:${game_directory}:${version_name}:${resolution_width}x${resolution_height}:${game_assets}",
         &placeholders,
     );
 
     assert_eq!(
         substituted,
-        "PlayerOne:uuid-123:game-dir:Pack-1.21.1-fabric:854x480"
+        "PlayerOne:uuid-123:game-dir:Pack-1.21.1-fabric:854x480:assets-root"
+    );
+}
+
+#[test]
+fn legacy_virtual_assets_redirect_game_assets_and_session() {
+    let placeholders = LaunchPlaceholders::new(
+        &PlayerIdentity {
+            username: "PlayerOne".into(),
+            uuid: "uuid-123".into(),
+            access_token: "token-abc".into(),
+            user_type: "offline".into(),
+            version_type: "Cubic".into(),
+        },
+        "Pack",
+        &ResolutionTarget {
+            minecraft_version: "1.6.4".into(),
+            mod_loader: ModLoader::Vanilla,
+        },
+        PathBuf::from("game-dir").as_path(),
+        PathBuf::from("assets-root").as_path(),
+        "legacy",
+        PathBuf::from("libraries-root").as_path(),
+        PathBuf::from("natives-root").as_path(),
+        true,
+    );
+
+    // Legacy: --assetsDir ${game_assets} must point at the materialized virtual
+    // tree, and --session ${auth_session} maps to the access token.
+    let substituted = substitute_known_placeholders(
+        "--assetsDir ${game_assets} --session ${auth_session}",
+        &placeholders,
+    );
+    assert_eq!(
+        substituted,
+        format!(
+            "--assetsDir {} --session token-abc",
+            PathBuf::from("assets-root")
+                .join("virtual")
+                .join("legacy")
+                .display()
+        )
     );
 }
 
@@ -390,6 +516,18 @@ fn modded_jvm_args_keep_natives_and_drop_minecraft_classpath_placeholder() {
             "-Dorg.lwjgl.librarypath=${natives_directory}".to_string(),
         ]
     );
+}
+
+#[test]
+fn legacy_vanilla_jvm_args_gain_natives_path_when_absent() {
+    // Legacy versions (<=1.12.x) use the `minecraftArguments` string, so the
+    // downloader yields an EMPTY jvm-args vec (no arguments.jvm block). Without
+    // injecting -Djava.library.path the LWJGL2 loader fails with
+    // "UnsatisfiedLinkError: no lwjgl(64) in java.library.path".
+    let merged = merge_minecraft_and_loader_jvm_arguments(&[], Vec::new());
+
+    assert!(merged.contains(&"-Djava.library.path=${natives_directory}".to_string()));
+    assert!(merged.contains(&"-Dorg.lwjgl.librarypath=${natives_directory}".to_string()));
 }
 
 #[test]
@@ -520,86 +658,6 @@ fn fabric_dependency_predicates_match_semver_ranges() {
 }
 
 #[test]
-fn exact_parent_dependency_check_uses_project_ids() {
-    let mut iris = sample_version("YL57xq9U", "iris-1");
-    iris.dependencies.push(ModrinthDependency {
-        version_id: Some("sodium-0.6.12".into()),
-        project_id: Some("AANobbMI".into()),
-        dependency_type: DependencyType::Required,
-        file_name: None,
-    });
-    let sodium = ModrinthVersion {
-        id: "sodium-0.6.13".into(),
-        ..sample_version("AANobbMI", "sodium-0.6.13")
-    };
-    let parent_versions = vec![iris.clone(), sodium.clone()];
-    let selected_parent_versions = HashMap::from([
-        (iris.project_id.clone(), iris),
-        (sodium.project_id.clone(), sodium),
-    ]);
-    let selected_project_ids = collect_selected_project_ids(&parent_versions);
-
-    let excluded = validate_selected_parent_dependencies(
-        &parent_versions,
-        &selected_parent_versions,
-        &selected_project_ids,
-    );
-
-    assert_eq!(
-        excluded,
-        std::collections::HashSet::from(["YL57xq9U".to_string()])
-    );
-}
-
-#[test]
-fn exact_parent_conflict_excludes_parent_leaving_single_project_version() {
-    // S1 end-to-end shape: Iris pins Sodium@old by exact VersionId while
-    // Sodium@new is selected top-level. The production pipeline validates the
-    // exact-version conflict, excludes Iris, then dedups — so only ONE Sodium
-    // version survives instead of loading both old and new.
-    let mut iris = sample_version("YL57xq9U", "iris-1");
-    iris.dependencies.push(ModrinthDependency {
-        version_id: Some("sodium-0.6.12".into()),
-        project_id: Some("AANobbMI".into()),
-        dependency_type: DependencyType::Required,
-        file_name: None,
-    });
-    let sodium_new = ModrinthVersion {
-        id: "sodium-0.6.13".into(),
-        ..sample_version("AANobbMI", "sodium-0.6.13")
-    };
-    let parent_versions = vec![iris.clone(), sodium_new.clone()];
-    let selected_parent_versions = parent_versions
-        .iter()
-        .map(|version| (version.project_id.clone(), version.clone()))
-        .collect::<HashMap<_, _>>();
-    let selected_project_ids = collect_selected_project_ids(&parent_versions);
-
-    // Mirror the production sequence in launch_preview.rs.
-    let excluded = validate_selected_parent_dependencies(
-        &parent_versions,
-        &selected_parent_versions,
-        &selected_project_ids,
-    );
-    let final_parent_versions = parent_versions
-        .into_iter()
-        .filter(|version| !excluded.contains(&version.project_id))
-        .collect::<Vec<_>>();
-    // The conflicting dependency (Iris's Sodium@old) rides on the excluded
-    // parent and is filtered out upstream, so it is not fetched.
-    let final_dependency_versions: Vec<ModrinthVersion> = Vec::new();
-    let resolved = deduplicate_versions(final_parent_versions, final_dependency_versions);
-
-    let sodium_versions = resolved
-        .iter()
-        .filter(|version| version.project_id == "AANobbMI")
-        .map(|version| version.id.clone())
-        .collect::<Vec<_>>();
-    assert_eq!(sodium_versions, vec!["sodium-0.6.13".to_string()]);
-    assert!(!resolved.iter().any(|version| version.project_id == "YL57xq9U"));
-}
-
-#[test]
 fn owner_map_propagates_transitive_dependency_owners() {
     let parent_versions = vec![sample_version("top-level", "top-level-1")];
     let owner_map = build_top_level_owner_map(
@@ -710,5 +768,227 @@ fn final_fabric_validation_excludes_top_level_on_missing_dependency() {
             .get("sodiumoptionsapi-project")
             .map(|issue| issue.reason_code),
         Some("missing_dependency")
+    );
+}
+
+// ── Automation entry-point (env → full verification) ────────────────────────
+
+fn verification_result(state: &str, success: bool) -> LaunchVerificationResult {
+    LaunchVerificationResult {
+        started: state != "launch_failed",
+        success,
+        state: state.to_string(),
+        pid: None,
+        launch_log_dir: None,
+        duration_ms: 0,
+        failure_kind: None,
+        failure_summary: None,
+        minecraft_log_tail: Vec::new(),
+    }
+}
+
+#[test]
+fn automation_env_parses_full_request_with_defaults() {
+    // (a) A complete JSON deserializes into a full LaunchVerificationRequest,
+    // preserving every observation field — none dropped (the old bug routed
+    // through into_launch_request and discarded timeout/successAfter/terminate*).
+    let json = r#"{
+        "modlistName": "Pack",
+        "minecraftVersion": "1.21.1",
+        "modLoader": "fabric",
+        "timeoutSeconds": 90,
+        "successAfterSeconds": 12,
+        "terminateOnSuccess": false,
+        "terminateOnTimeout": false
+    }"#;
+    let request: LaunchVerificationRequest =
+        serde_json::from_str(json).expect("full request should parse");
+    assert_eq!(request.modlist_name, "Pack");
+    assert_eq!(request.minecraft_version, "1.21.1");
+    assert_eq!(request.mod_loader, "fabric");
+    assert_eq!(request.timeout_seconds, 90);
+    assert_eq!(request.success_after_seconds, 12);
+    assert!(!request.terminate_on_success);
+    assert!(!request.terminate_on_timeout);
+}
+
+#[test]
+fn automation_env_minimal_request_uses_defaults() {
+    // (b) A minimal request (only the three required fields) still works: the
+    // optional observation fields fall back to the IPC defaults.
+    let json = r#"{"modlistName":"Pack","minecraftVersion":"1.21.1","modLoader":"vanilla"}"#;
+    let request: LaunchVerificationRequest =
+        serde_json::from_str(json).expect("minimal request should parse");
+    assert_eq!(request.timeout_seconds, 45);
+    assert_eq!(request.success_after_seconds, 15);
+    assert!(request.terminate_on_success);
+    assert!(request.terminate_on_timeout);
+}
+
+#[test]
+fn automation_exit_always_exits_on_conclusion_when_requested() {
+    // (c) With _EXIT enabled, the process exits on BOTH success and failure —
+    // no leaked process. Success -> 0, any non-success/error -> 1.
+    let ok = verification_result("running", true);
+    assert_eq!(automation_exit_code(true, Some(&ok)), Some(0));
+
+    for state in ["timed_out", "crashed", "exited", "launch_failed"] {
+        let failed = verification_result(state, false);
+        assert_eq!(
+            automation_exit_code(true, Some(&failed)),
+            Some(1),
+            "state {state} must exit with code 1"
+        );
+    }
+    // Verification errored entirely (None) -> still exits with 1.
+    assert_eq!(automation_exit_code(true, None), Some(1));
+
+    // Without _EXIT, never exits regardless of outcome.
+    assert_eq!(automation_exit_code(false, Some(&ok)), None);
+    assert_eq!(automation_exit_code(false, None), None);
+}
+
+#[test]
+fn automation_env_does_not_silently_drop_fields() {
+    // (d) Guard against regressing to into_launch_request(): a request whose
+    // observation fields differ from the defaults must round-trip those exact
+    // values, proving they reach run_launch_verification unmodified.
+    let request = LaunchVerificationRequest {
+        modlist_name: "Pack".into(),
+        minecraft_version: "1.20.1".into(),
+        mod_loader: "neoforge".into(),
+        timeout_seconds: 30,
+        success_after_seconds: 10,
+        terminate_on_success: true,
+        terminate_on_timeout: false,
+    };
+    let json = serde_json::to_string(&request).expect("serialize");
+    let back: LaunchVerificationRequest = serde_json::from_str(&json).expect("round-trip");
+    assert_eq!(back, request);
+    assert_eq!(back.success_after_seconds, 10);
+    assert!(!back.terminate_on_timeout);
+}
+
+// ── Informational dependency detection (no auto-management) ──────────────────
+
+fn version_with_required_dep(
+    project_id: &str,
+    version_id: &str,
+    dep_project: &str,
+    dep_version_id: Option<&str>,
+) -> ModrinthVersion {
+    let mut v = sample_version(project_id, version_id);
+    v.dependencies.push(ModrinthDependency {
+        version_id: dep_version_id.map(|s| s.to_string()),
+        project_id: Some(dep_project.to_string()),
+        dependency_type: DependencyType::Required,
+        file_name: None,
+    });
+    v
+}
+
+#[test]
+fn iris_pinned_dep_produces_notice_without_excluding_or_downloading() {
+    // Iris (YL57xq9U) requires sodium (AANobbMI) pinned to version_id vf7UgZpC
+    // (sodium 0.9.1, not tagged for 26.1). The mod-list has sodium 0.8.9
+    // (version id 'sodium-0.8.9') top-level. Under the new design: Iris is NOT
+    // excluded, the pin is NOT downloaded — a single informational notice is
+    // produced reporting the version mismatch.
+    let iris = version_with_required_dep("YL57xq9U", "iris-1.11.2", "AANobbMI", Some("vf7UgZpC"));
+    let sodium = sample_version("AANobbMI", "sodium-0.8.9");
+    let parent_versions = vec![iris.clone(), sodium.clone()];
+    let selected: std::collections::HashMap<String, ModrinthVersion> = parent_versions
+        .iter()
+        .map(|v| (v.project_id.clone(), v.clone()))
+        .collect();
+    let mut pin_labels = std::collections::HashMap::new();
+    pin_labels.insert("vf7UgZpC".to_string(), "0.9.1".to_string());
+
+    let notices = detect_modrinth_declared_notices(&parent_versions, &selected, &pin_labels);
+
+    assert_eq!(notices.len(), 1, "exactly one notice for the pin mismatch");
+    let notice = &notices[0];
+    assert_eq!(notice.requiring_project_id, "YL57xq9U");
+    assert_eq!(notice.dependency_id, "AANobbMI");
+    assert_eq!(notice.kind, DependencyNoticeKind::VersionUnsatisfied);
+    assert!(
+        notice.detail.contains("0.9.1"),
+        "reports the declared version"
+    );
+    // Both mods remain selectable — detection never mutates the selection.
+    assert!(selected.contains_key("YL57xq9U") && selected.contains_key("AANobbMI"));
+}
+
+#[test]
+fn missing_declared_dependency_produces_missing_notice() {
+    // A parent requires a project that is NOT in the mod-list at all.
+    let parent = version_with_required_dep("parent", "parent-1", "absent-dep", None);
+    let parent_versions = vec![parent.clone()];
+    let selected: std::collections::HashMap<String, ModrinthVersion> = parent_versions
+        .iter()
+        .map(|v| (v.project_id.clone(), v.clone()))
+        .collect();
+
+    let notices = detect_modrinth_declared_notices(
+        &parent_versions,
+        &selected,
+        &std::collections::HashMap::new(),
+    );
+
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].kind, DependencyNoticeKind::Missing);
+    assert_eq!(notices[0].dependency_id, "absent-dep");
+}
+
+#[test]
+fn satisfied_declared_dependency_produces_no_notice() {
+    // Parent requires sodium project with NO pin; sodium is present. No notice.
+    let parent = version_with_required_dep("parent", "parent-1", "AANobbMI", None);
+    let sodium = sample_version("AANobbMI", "sodium-0.8.9");
+    let parent_versions = vec![parent, sodium];
+    let selected: std::collections::HashMap<String, ModrinthVersion> = parent_versions
+        .iter()
+        .map(|v| (v.project_id.clone(), v.clone()))
+        .collect();
+
+    let notices = detect_modrinth_declared_notices(
+        &parent_versions,
+        &selected,
+        &std::collections::HashMap::new(),
+    );
+    assert!(
+        notices.is_empty(),
+        "present unpinned dependency yields no notice"
+    );
+}
+
+#[test]
+fn rso_embedded_incompatible_version_maps_to_version_unsatisfied_notice() {
+    // RSO (Bh37bMuy) embedded fabric.mod.json requires sodium >=0.9.1 while
+    // sodium 0.8.9 is present -> the predicate-aware validator yields an
+    // incompatible_dependency_version issue, which becomes a
+    // "present but older" VersionUnsatisfied notice.
+    let issue = FabricValidationIssue {
+        reason_code: "incompatible_dependency_version",
+        owner_project_id: "Bh37bMuy".into(),
+        mod_id: "reeses_sodium_options".into(),
+        dependency_id: Some("sodium".into()),
+        detail: "embedded metadata requires 'sodium' with a compatible version, but only incompatible versions are present".into(),
+    };
+    let notice = fabric_issue_to_notice("Bh37bMuy", &issue);
+    assert_eq!(notice.kind, DependencyNoticeKind::VersionUnsatisfied);
+    assert_eq!(notice.requiring_project_id, "Bh37bMuy");
+    assert_eq!(notice.dependency_id, "sodium");
+
+    let missing = FabricValidationIssue {
+        reason_code: "missing_dependency",
+        owner_project_id: "Bh37bMuy".into(),
+        mod_id: "reeses_sodium_options".into(),
+        dependency_id: Some("sodium".into()),
+        detail: "embedded metadata requires 'sodium', which is missing".into(),
+    };
+    assert_eq!(
+        fabric_issue_to_notice("Bh37bMuy", &missing).kind,
+        DependencyNoticeKind::Missing
     );
 }

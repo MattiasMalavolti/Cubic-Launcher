@@ -182,10 +182,31 @@ pub fn select_java_for_requirement(
     installations: &[JavaInstallation],
     required_version: u32,
 ) -> Option<JavaInstallation> {
-    // Old Minecraft/Forge stacks are not reliably compatible with newer Java
-    // class libraries, even when Minecraft's manifest only states a minimum.
-    // Prefer a predictable exact runtime and let the launcher download it when
-    // it is missing.
+    // Nearest-higher policy: prefer an exact major, else fall back to the
+    // lowest installed major that is still >= the requirement. Adoptium no
+    // longer ships EOL majors (e.g. Java 16), so a launch requiring one must be
+    // able to run on the next available major. Picking the *lowest* qualifying
+    // major keeps the runtime as close as possible to what the game expects.
+    installations
+        .iter()
+        .filter(|installation| installation.version >= required_version)
+        .cloned()
+        .min_by(|left, right| {
+            left.version
+                .cmp(&right.version)
+                .then(left.source.cmp(&right.source))
+                .then(left.path.cmp(&right.path))
+        })
+}
+
+/// Select only an *exact* major match, never a higher one. Used as the
+/// pre-download gate so a legacy launch that genuinely needs an EOL-adjacent
+/// major (e.g. Java 8) still triggers the exact download instead of silently
+/// reusing a newer installed runtime.
+pub fn select_exact_java_for_requirement(
+    installations: &[JavaInstallation],
+    required_version: u32,
+) -> Option<JavaInstallation> {
     installations
         .iter()
         .filter(|installation| installation.version == required_version)
@@ -401,7 +422,8 @@ mod tests {
     use super::{
         candidates_from_java_home_root, candidates_from_path_entries,
         inspect_java_binary_candidates, parse_java_architecture, parse_java_major_version,
-        persist_java_installations, required_java_version_for_minecraft, select_java_for_minecraft,
+        persist_java_installations, required_java_version_for_minecraft,
+        select_exact_java_for_requirement, select_java_for_minecraft,
         select_java_for_requirement, JavaBinaryCandidate, JavaBinaryInspector, JavaInstallation,
         JavaInstallationSource, JavaProbe,
     };
@@ -583,7 +605,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_java_requirement_does_not_select_newer_runtime() {
+    fn requirement_falls_back_to_nearest_higher_when_exact_missing() {
+        // Goal decision: exact-major is no longer mandatory. Adoptium drops EOL
+        // majors (e.g. 16), so a requirement for a missing major must resolve to
+        // the lowest installed major that is still >= the requirement.
         let installations = vec![JavaInstallation {
             path: PathBuf::from("C:/Java/jdk-21/bin/java.exe"),
             version: 21,
@@ -592,9 +617,48 @@ mod tests {
             source: JavaInstallationSource::SystemPath,
         }];
 
-        let selected = select_java_for_requirement(&installations, 17);
+        let selected = select_java_for_requirement(&installations, 17)
+            .expect("nearest-higher runtime should be selected");
+        assert_eq!(selected.version, 21);
 
-        assert!(selected.is_none());
+        // The exact gate, by contrast, must still reject a newer-only set so the
+        // download path can fetch the precise major when it is available.
+        assert!(select_exact_java_for_requirement(&installations, 17).is_none());
+    }
+
+    #[test]
+    fn requirement_prefers_exact_over_higher_and_picks_lowest_qualifying() {
+        let installations = vec![
+            JavaInstallation {
+                path: PathBuf::from("C:/Java/jdk-17/bin/java.exe"),
+                version: 17,
+                auto_detected: true,
+                architecture: "x64".into(),
+                source: JavaInstallationSource::LauncherManaged,
+            },
+            JavaInstallation {
+                path: PathBuf::from("C:/Java/jdk-21/bin/java.exe"),
+                version: 21,
+                auto_detected: true,
+                architecture: "x64".into(),
+                source: JavaInstallationSource::SystemPath,
+            },
+        ];
+
+        // Exact major present -> use it, not the higher one.
+        assert_eq!(
+            select_java_for_requirement(&installations, 17)
+                .expect("exact runtime should be selected")
+                .version,
+            17
+        );
+        // Requirement below both -> lowest qualifying major (nearest-higher).
+        assert_eq!(
+            select_java_for_requirement(&installations, 16)
+                .expect("nearest-higher runtime should be selected")
+                .version,
+            17
+        );
     }
 
     #[test]
