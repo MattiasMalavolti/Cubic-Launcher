@@ -51,6 +51,7 @@ import {
 } from "./app/row-state";
 import {
   fetchModMetadata,
+  seedModName,
   isTauri,
   loadAllCardIcons,
   loadEditorSnapshot,
@@ -65,6 +66,7 @@ import { useAppPersistence } from "./app/persistence-effects";
 import { Header } from "./components/Header";
 import { Sidebar } from "./components/Sidebar";
 import { ModListEditor } from "./components/ModListEditor";
+import { bumpContentVersion, seedContentName } from "./components/mod-list-editor/ContentTabView";
 import { LaunchPanel } from "./components/LaunchPanel";
 import { AddModDialog } from "./components/AddModDialog";
 import {
@@ -403,6 +405,10 @@ export default function App() {
       alternatives: [],
     };
     setModRowsState(c => [...c, tempRow]);
+    // The dialog already knows the human-readable title; seed the name cache
+    // so the card keeps it after the snapshot reload even if the Modrinth
+    // metadata fetch fails.
+    seedModName(modId, displayName);
     void fetchModMetadata([tempRow]);
 
     if (!isTauri()) { logger.warn("App", "handleAddModrinth skipped — no backend"); return; }
@@ -843,11 +849,11 @@ export default function App() {
       </div>
 
       {/* Modals */}
-      <AddModDialog onAddModrinth={handleAddModrinth} onAddContent={async (contentType, id, _name) => {
+      <AddModDialog onAddModrinth={handleAddModrinth} onAddContent={async (contentType, id, name) => {
         if (!selectedModListName()) return;
         try {
           await invoke("add_content_command", { input: { modlistName: selectedModListName(), contentType, id, source: "modrinth" } });
-          const { bumpContentVersion } = await import("./components/mod-list-editor/ContentTabView");
+          seedContentName(id, name);
           bumpContentVersion();
         } catch (err) {
           pushUiError({ title: "Failed to add content", message: `Could not add '${id}'.`, detail: String(err), severity: "error", scope: "launch" });
