@@ -491,6 +491,12 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
     }
 
     if input.config_files {
+        add_directory_contents(
+            &mut archive,
+            &mut added_paths,
+            launcher_paths.configs_cache_dir(),
+            &format!("{archive_root}/cache/configs"),
+        )?;
         // Collect config files referenced in rules.json custom_configs
         let rules_path = modlist_dir.join(RULES_FILENAME);
         if rules_path.exists() {
@@ -1152,7 +1158,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pre-existing: export omits cache/configs entry; out of pass-1 scope"]
     fn export_archive_includes_rules_presentation_and_selected_assets() {
         let root_dir = unique_test_root();
         let modlist_dir = root_dir.join("mod-lists").join("Sky Pack");
@@ -1230,6 +1235,14 @@ mod tests {
             .read_to_string(&mut presentation)
             .expect("presentation should read");
         assert!(presentation.contains("Bring elytra"));
+
+        let mut config = String::new();
+        archive
+            .by_name("Sky Pack/cache/configs/sodium/options.json")
+            .expect("config entry should exist")
+            .read_to_string(&mut config)
+            .expect("config should read");
+        assert_eq!(config, "config");
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
