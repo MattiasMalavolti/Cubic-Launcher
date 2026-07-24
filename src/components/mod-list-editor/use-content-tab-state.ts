@@ -18,6 +18,15 @@ export function bumpContentVersion() {
   setContentVersion(v => v + 1);
 }
 
+// Readable titles for Modrinth content ids/slugs. Filled from the add dialog
+// (seedContentName) and from successful metadata fetches so cards keep showing
+// titles instead of raw project IDs when a later fetch is unavailable.
+const contentNameCache = new Map<string, string>();
+
+export function seedContentName(id: string, name: string) {
+  if (id && name && name !== id) contentNameCache.set(id, name);
+}
+
 const ctlId = (item: ContentTopLevelItem) => item.kind === "entry" ? item.entry.id : `group:${item.id}`;
 
 const removeFromArr = (arr: string[], id: string) => arr.filter(x => x !== id);
@@ -67,10 +76,16 @@ export function useContentTabState(props: ContentTabViewProps) {
       setGroups(nextGroups);
 
       const modrinthIds = list.filter(entry => entry.source === "modrinth").map(entry => entry.id);
-      if (modrinthIds.length === 0) {
-        setMeta(new Map());
-        return;
+      // Show already-known readable names immediately; the fetch below only
+      // refines them (icons, corrected titles). If it fails, cached names keep
+      // cards from falling back to raw project IDs.
+      const nextMeta = new Map<string, ContentMeta>();
+      for (const id of modrinthIds) {
+        const cached = contentNameCache.get(id);
+        if (cached) nextMeta.set(id, { name: cached });
       }
+      setMeta(nextMeta);
+      if (modrinthIds.length === 0) return;
 
       try {
         const param = encodeURIComponent(JSON.stringify(modrinthIds));
@@ -79,13 +94,16 @@ export function useContentTabState(props: ContentTabViewProps) {
         });
         if (!response.ok) return;
         const projects: Array<{ id: string; slug: string; title: string; icon_url?: string | null }> = await response.json();
-        const nextMeta = new Map<string, ContentMeta>();
         for (const project of projects) {
           const data = { name: project.title, iconUrl: project.icon_url ?? undefined };
           if (project.slug) nextMeta.set(project.slug, data);
           if (project.id) nextMeta.set(project.id, data);
+          if (project.title) {
+            if (project.slug) contentNameCache.set(project.slug, project.title);
+            if (project.id) contentNameCache.set(project.id, project.title);
+          }
         }
-        setMeta(nextMeta);
+        setMeta(new Map(nextMeta));
       } catch {
         // best effort
       }
