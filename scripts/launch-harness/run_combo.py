@@ -168,6 +168,10 @@ def run_combo(
     # Force X11 backend so the launcher (and Minecraft) target the X display
     # instead of Wayland, matching xvfb / XWayland setups deterministically.
     env.setdefault("GDK_BACKEND", "x11")
+    # Disable WebKit's DMABUF renderer: on NVIDIA (incl. under XWayland/Hyprland)
+    # it fails to allocate GBM buffers and the webview never initializes, which
+    # can poison the whole launch. Harmless elsewhere.
+    env.setdefault("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
 
     command = _build_command(binary_path, display)
     external_timeout = spec.timeout_seconds + external_margin_s

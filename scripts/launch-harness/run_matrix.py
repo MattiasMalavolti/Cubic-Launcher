@@ -139,8 +139,14 @@ def run_matrix(
     report_dir: Path,
     keep: bool,
     workspace_path: str | None = None,
+    only: tuple[str, ...] = (),
 ) -> bool:
     combos = ci_matrix() if scope == "ci" else full_local_matrix()
+    if only:
+        wanted = set(only)
+        combos = [c for c in combos if f"{c.loader}@{c.mc_version}" in wanted]
+        if not combos:
+            raise SystemExit(f"--only matched no combos: {sorted(wanted)}")
     report_dir.mkdir(parents=True, exist_ok=True)
 
     if workspace_path is not None:
@@ -237,6 +243,14 @@ if __name__ == "__main__":
         help="reuse an existing persistent data root (XDG_DATA_HOME); seed only if "
         "absent, never reset/clobber. e.g. ~/cubic-harness-data",
     )
+    parser.add_argument(
+        "--only",
+        nargs="+",
+        default=[],
+        metavar="loader@mc",
+        help="run only these combos (e.g. forge@1.12.2 vanilla@1.6.4); "
+        "re-validate specific reds without the full sweep",
+    )
     args = parser.parse_args()
 
     ok = run_matrix(
@@ -248,5 +262,6 @@ if __name__ == "__main__":
         report_dir=Path(args.report_dir),
         keep=args.keep,
         workspace_path=args.workspace,
+        only=tuple(args.only),
     )
     raise SystemExit(0 if ok else 1)
