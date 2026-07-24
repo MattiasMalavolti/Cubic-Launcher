@@ -15,8 +15,8 @@ use crate::java_runtime::{
     discover_java_installations, persist_java_installations, select_exact_java_for_requirement,
     select_java_for_requirement, CommandJavaBinaryInspector, JavaBinaryInspector,
 };
-use crate::launcher_paths::LauncherPaths;
 use crate::launch_command::PreparedLaunchCommand;
+use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::{
     LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata, LoaderMetadataClient,
 };
@@ -571,6 +571,33 @@ pub(super) fn build_instance_root(
         )))
 }
 
+pub(super) fn load_active_account_for_launch<S: crate::token_storage::SecretStore>(
+    connection: &Connection,
+    secret_store: S,
+) -> Result<Option<crate::token_storage::PlaintextAccountRecord>> {
+    use crate::microsoft_auth::AccountsRepository;
+    use crate::token_storage::{AccountTokenCipher, PlaintextAccountRecord};
+
+    let Some(account) = AccountsRepository::new(connection).load_active_account()? else {
+        return Ok(None);
+    };
+    let token_cipher = AccountTokenCipher::new(secret_store);
+    let refresh_token = account
+        .refresh_token_enc
+        .as_deref()
+        .and_then(|payload| token_cipher.decrypt_token(payload).ok());
+
+    Ok(Some(PlaintextAccountRecord {
+        microsoft_id: account.microsoft_id,
+        xbox_gamertag: account.xbox_gamertag,
+        minecraft_uuid: account.minecraft_uuid,
+        access_token: None,
+        refresh_token,
+        profile_data: account.profile_data,
+        is_active: account.is_active,
+    }))
+}
+
 pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Result<PlayerIdentity> {
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
         format!(
@@ -579,15 +606,19 @@ pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Resu
         )
     })?;
 
-    // SECURITY (C1): decrypt the active account from the AES-GCM encrypted
-    // columns. profile_data no longer carries tokens. Extract everything BEFORE
-    // async work (Connection is not Send).
-    let raw_account = {
-        use crate::token_storage::{EncryptedAccountsRepository, KeyringSecretStore};
-        EncryptedAccountsRepository::new(&connection, KeyringSecretStore::new())
-            .load_active_account()
-            .ok()
-            .flatten()
+    // SECURITY (C1): profile_data no longer carries tokens. Preserve the
+    // non-secret identity fields even when the OS keyring is unavailable or a
+    // token blob is corrupt; only the refresh token needs decryption here.
+    // Extract everything BEFORE async work (Connection is not Send).
+    let raw_account = match load_active_account_for_launch(
+        &connection,
+        crate::token_storage::KeyringSecretStore::new(),
+    ) {
+        Ok(account) => account,
+        Err(error) => {
+            eprintln!("[Auth] Failed to load active account metadata: {error:#}");
+            None
+        }
     };
     let db_path = launcher_paths.database_path().to_path_buf();
     drop(connection); // Release connection before async work.
@@ -687,15 +718,19 @@ pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Resu
                                         &conn,
                                         KeyringSecretStore::new(),
                                     )
-                                    .upsert_account(&PlaintextAccountRecord {
-                                        microsoft_id: microsoft_id.clone(),
-                                        xbox_gamertag: raw.xbox_gamertag.clone(),
-                                        minecraft_uuid: Some(login.minecraft_uuid.clone()),
-                                        access_token: Some(login.minecraft_access_token.clone()),
-                                        refresh_token: Some(rotated_refresh),
-                                        profile_data: Some(new_profile),
-                                        is_active: true,
-                                    });
+                                    .upsert_account(
+                                        &PlaintextAccountRecord {
+                                            microsoft_id: microsoft_id.clone(),
+                                            xbox_gamertag: raw.xbox_gamertag.clone(),
+                                            minecraft_uuid: Some(login.minecraft_uuid.clone()),
+                                            access_token: Some(
+                                                login.minecraft_access_token.clone(),
+                                            ),
+                                            refresh_token: Some(rotated_refresh),
+                                            profile_data: Some(new_profile),
+                                            is_active: true,
+                                        },
+                                    );
                                 }
 
                                 return Ok(PlayerIdentity {
@@ -772,7 +807,8 @@ pub(super) async fn select_or_download_java(
 
     // Exact installed match wins: preserves legacy exact-major behavior and
     // avoids substituting when the precise runtime is already present.
-    if let Some(installation) = select_exact_java_for_requirement(&installations, required_version) {
+    if let Some(installation) = select_exact_java_for_requirement(&installations, required_version)
+    {
         return Ok(installation.path);
     }
 
@@ -865,7 +901,10 @@ async fn resolve_downloadable_java_package(
 ) -> Result<(u32, crate::adoptium::AdoptiumPackage)> {
     const MAX_LOOKAHEAD: u32 = 6;
     for candidate in required_version..=required_version + MAX_LOOKAHEAD {
-        if let Some(package) = adoptium.fetch_latest_jre_package(candidate, os, arch).await? {
+        if let Some(package) = adoptium
+            .fetch_latest_jre_package(candidate, os, arch)
+            .await?
+        {
             return Ok((candidate, package));
         }
     }
@@ -1176,7 +1215,11 @@ mod tests {
             builder
                 .append_data(&mut header, "jdk-17/bin/java", &script[..])
                 .expect("append java entry");
-            builder.into_inner().expect("finish tar").finish().expect("finish gz");
+            builder
+                .into_inner()
+                .expect("finish tar")
+                .finish()
+                .expect("finish gz");
         }
 
         extract_java_archive(&archive_path, &install_dir).expect("tar.gz should extract");
