@@ -12,8 +12,8 @@ use crate::adoptium::{
     host_adoptium_os, normalize_adoptium_architecture, plan_runtime_download, AdoptiumClient,
 };
 use crate::java_runtime::{
-    discover_java_installations, persist_java_installations, select_java_for_requirement,
-    CommandJavaBinaryInspector, JavaBinaryInspector,
+    discover_java_installations, persist_java_installations, select_exact_java_for_requirement,
+    select_java_for_requirement, CommandJavaBinaryInspector, JavaBinaryInspector,
 };
 use crate::launcher_paths::LauncherPaths;
 use crate::launch_command::PreparedLaunchCommand;
@@ -27,8 +27,8 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::artifacts::extract_artifact_name;
 use super::{
-    download_file, emit_log, emit_progress, EffectiveLaunchSettings, LaunchPlaceholders,
-    LoggingProcessEventSink, PlayerIdentity, StartedLaunch, ACTIVE_MC_PID,
+    download_file, emit_launcher_issue, emit_log, emit_progress, EffectiveLaunchSettings,
+    LaunchPlaceholders, LoggingProcessEventSink, PlayerIdentity, StartedLaunch, ACTIVE_MC_PID,
 };
 
 pub(super) async fn materialize_loader_libraries(
@@ -742,17 +742,38 @@ pub(super) async fn select_or_download_java(
     })?;
     persist_java_installations(&connection, &installations)?;
 
-    if let Some(installation) = select_java_for_requirement(&installations, required_version) {
+    // Exact installed match wins: preserves legacy exact-major behavior and
+    // avoids substituting when the precise runtime is already present.
+    if let Some(installation) = select_exact_java_for_requirement(&installations, required_version) {
         return Ok(installation.path);
     }
 
-    // No suitable Java found; auto-download via Adoptium.
+    let adoptium = AdoptiumClient::new();
+    let os = host_adoptium_os();
+    let arch = normalize_adoptium_architecture(std::env::consts::ARCH);
+
+    // Resolve the nearest major Adoptium actually ships. EOL majors (e.g. Java
+    // 16) return an empty asset list, so this walks upward to the next
+    // available major (16 -> 17).
+    let (effective_version, package) =
+        resolve_downloadable_java_package(&adoptium, required_version, os, arch).await?;
+
+    if effective_version != required_version {
+        emit_java_substitution_notice(app_handle, required_version, effective_version)?;
+        // The substitute major may already be installed from an earlier launch.
+        if let Some(installation) =
+            select_exact_java_for_requirement(&installations, effective_version)
+        {
+            return Ok(installation.path);
+        }
+    }
+
     emit_log(
         app_handle,
         ProcessLogStream::Stdout,
         format!(
-            "[Java] No Java {} found, downloading from Adoptium...",
-            required_version
+            "[Java] No Java {} found, downloading Java {} from Adoptium...",
+            required_version, effective_version
         ),
     )?;
     emit_progress(
@@ -760,26 +781,12 @@ pub(super) async fn select_or_download_java(
         "resolving",
         85,
         "Downloading Java",
-        &format!("Fetching Java {} runtime from Adoptium.", required_version),
+        &format!("Fetching Java {} runtime from Adoptium.", effective_version),
     )?;
-
-    let adoptium = AdoptiumClient::new();
-    let os = host_adoptium_os();
-    let arch = normalize_adoptium_architecture(std::env::consts::ARCH);
-
-    let package = adoptium
-        .fetch_latest_jre_package(required_version, os, arch)
-        .await?
-        .with_context(|| {
-            format!(
-                "Adoptium has no JRE {} for {}/{}",
-                required_version, os, arch
-            )
-        })?;
 
     let plan = plan_runtime_download(
         launcher_paths.java_runtimes_dir(),
-        required_version,
+        effective_version,
         package,
         os,
         arch,
@@ -802,7 +809,8 @@ pub(super) async fn select_or_download_java(
         .await
         .context("Java extraction task panicked")??;
 
-    // Re-scan and select.
+    // Re-scan and select nearest-higher, so a substituted major satisfies the
+    // original requirement.
     let installations = discover_java_installations(launcher_paths.java_runtimes_dir())?;
     persist_java_installations(&connection, &installations)?;
 
@@ -811,10 +819,57 @@ pub(super) async fn select_or_download_java(
         .with_context(|| {
             format!(
                 "Java {} was downloaded but could not be found after extraction. Check {}",
-                required_version,
+                effective_version,
                 launcher_paths.java_runtimes_dir().display()
             )
         })
+}
+
+/// Find the nearest major >= `required_version` that Adoptium actually ships a
+/// JRE for, returning the resolved major and its latest package. Adoptium
+/// serves an empty asset list for EOL majors (e.g. Java 16), so this walks
+/// upward a bounded number of steps before giving up.
+async fn resolve_downloadable_java_package(
+    adoptium: &AdoptiumClient,
+    required_version: u32,
+    os: &str,
+    arch: &str,
+) -> Result<(u32, crate::adoptium::AdoptiumPackage)> {
+    const MAX_LOOKAHEAD: u32 = 6;
+    for candidate in required_version..=required_version + MAX_LOOKAHEAD {
+        if let Some(package) = adoptium.fetch_latest_jre_package(candidate, os, arch).await? {
+            return Ok((candidate, package));
+        }
+    }
+    bail!(
+        "Adoptium has no JRE for Java {} or the next {} majors ({}/{})",
+        required_version,
+        MAX_LOOKAHEAD,
+        os,
+        arch
+    )
+}
+
+/// Inform the user that the exact Java major was unavailable and a higher major
+/// was substituted. Non-blocking, in line with the launcher's "inform, don't
+/// silently decide" design.
+fn emit_java_substitution_notice(
+    app_handle: &tauri::AppHandle,
+    required_version: u32,
+    effective_version: u32,
+) -> Result<()> {
+    emit_launcher_issue(
+        app_handle,
+        "Java version substituted",
+        &format!(
+            "Java {required_version} is unavailable for download; using Java {effective_version} instead."
+        ),
+        &format!(
+            "This Minecraft version targets Java {required_version}, which Adoptium no longer distributes (end-of-life). The launcher selected the nearest available runtime, Java {effective_version}. If you hit issues, install Java {required_version} manually and set a Java override in settings."
+        ),
+        "warning",
+        "launch",
+    )
 }
 
 /// Extract a downloaded JRE archive into `install_dir`, dispatching on the
