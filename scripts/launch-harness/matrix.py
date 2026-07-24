@@ -52,7 +52,8 @@ STRATUM_A: list[MatrixVersion] = [
                   loaders=("vanilla", "fabric", "forge")),
     MatrixVersion("1.20.1", "ci", "first NeoForge-supported side (net.neoforged Prism + installer)"),
     MatrixVersion("1.20.4", "ci", "last 1.20 on Java 17"),
-    MatrixVersion("1.20.5", "ci", "first Java 21 (boundary is patch 5, not 1.20.6)"),
+    MatrixVersion("1.20.5", "ci", "first Java 21 (boundary is patch 5, not 1.20.6); Forge skipped 1.20.5",
+                  loaders=("vanilla", "fabric", "neoforge")),
 ]
 
 # Stratum B — same code path as their band; local full sweep only.
@@ -94,6 +95,8 @@ NEGATIVE_FIXTURES: list[NegativeFixture] = [
                     "NeoForge not available before 1.20.1 -> metadata fetch fails"),
     NegativeFixture("neoforge", "1.19.4", "launch_failed",
                     "NeoForge not available before 1.20.1 -> metadata fetch fails"),
+    NegativeFixture("forge", "1.20.5", "launch_failed",
+                    "Forge skipped 1.20.5 (MC 1.20.4 -> 1.20.6 for Forge) -> no metadata"),
 ]
 
 
