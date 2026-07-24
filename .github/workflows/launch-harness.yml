@@ -70,8 +70,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/harness-xdg
-          key: harness-assets-${{ github.run_id }}
-          restore-keys: harness-assets-
+          key: harness-assets-${{ runner.os }}-${{ hashFiles('scripts/launch-harness/matrix.py') }}
+          restore-keys: harness-assets-${{ runner.os }}-
 
       - name: Build launcher binary
         run: cargo build --bin cubic_launcher --manifest-path src-tauri/Cargo.toml
@@ -87,6 +87,7 @@ jobs:
             --success-after "$SUCCESS_AFTER" \
             --timeout 900 \
             --report-dir scripts/launch-harness/reports \
+            --workspace /tmp/harness-xdg \
             --binary src-tauri/target/debug/cubic_launcher
 
       - name: Upload matrix report

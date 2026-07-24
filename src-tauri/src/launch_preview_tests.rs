@@ -7,21 +7,74 @@ use crate::modrinth::{DependencyType, ModrinthDependency, ModrinthFile, Modrinth
 use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
-    build_instance_root, build_modded_classpath_entries, build_top_level_owner_map,
-    contained_loader_library_path, embedded_min_java_requirement,
-    fabric_dependency_predicates_match, filter_minecraft_launch_game_arguments,
-    forge_wrapper_installer_artifact, load_modlist, local_mod_jar_path,
-    maven_artifact_relative_path, merge_minecraft_and_loader_game_arguments,
-    merge_minecraft_and_loader_jvm_arguments, minecraft_version_predicate_matches,
-    minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
-    substitute_known_placeholders, validate_content_filename, validate_final_fabric_runtime,
-    automation_exit_code, detect_modrinth_declared_notices,
-    fabric_issue_to_notice, DependencyNoticeKind, EffectiveLaunchSettings,
+    automation_exit_code, build_instance_root, build_modded_classpath_entries,
+    build_top_level_owner_map, contained_loader_library_path, detect_modrinth_declared_notices,
+    embedded_min_java_requirement, fabric_dependency_predicates_match, fabric_issue_to_notice,
+    filter_minecraft_launch_game_arguments, forge_wrapper_installer_artifact,
+    load_active_account_for_launch, load_modlist, local_mod_jar_path, maven_artifact_relative_path,
+    merge_minecraft_and_loader_game_arguments, merge_minecraft_and_loader_jvm_arguments,
+    minecraft_version_predicate_matches, minimum_java_version_for_predicate, parse_mod_loader,
+    relative_loader_library_path, substitute_known_placeholders, validate_content_filename,
+    validate_final_fabric_runtime, DependencyNoticeKind, EffectiveLaunchSettings,
     EmbeddedFabricModMetadata, EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
     FabricValidationIssue, LaunchPlaceholders, LaunchVerificationRequest, LaunchVerificationResult,
     OwnedEmbeddedFabricModMetadata, PlayerIdentity,
 };
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
+
+#[test]
+fn launch_account_keeps_identity_when_token_key_is_unavailable() {
+    struct UnavailableSecretStore;
+
+    impl crate::token_storage::SecretStore for UnavailableSecretStore {
+        fn get_secret(&self, _key: &str) -> anyhow::Result<Option<String>> {
+            Err(anyhow::anyhow!("keyring unavailable"))
+        }
+
+        fn set_secret(&self, _key: &str, _secret: &str) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("keyring unavailable"))
+        }
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let database_path = std::env::temp_dir().join(format!(
+        "cubic-launch-account-{}-{timestamp}.db",
+        std::process::id()
+    ));
+    crate::database::initialize_database(&database_path).expect("initialize database");
+    let connection = rusqlite::Connection::open(&database_path).expect("open database");
+    crate::microsoft_auth::AccountsRepository::new(&connection)
+        .upsert_account(&crate::microsoft_auth::AccountRecord {
+            microsoft_id: "microsoft-id".into(),
+            xbox_gamertag: Some("StoredPlayer".into()),
+            minecraft_uuid: Some("123456781234123412341234567890ab".into()),
+            access_token_enc: Some(vec![1, 2, 3]),
+            refresh_token_enc: Some(vec![1, 2, 3]),
+            profile_data: Some(r#"{"username":"ProfilePlayer"}"#.into()),
+            is_active: true,
+        })
+        .expect("insert active account");
+
+    let loaded = load_active_account_for_launch(&connection, UnavailableSecretStore)
+        .expect("load active account")
+        .expect("active account");
+
+    assert_eq!(loaded.xbox_gamertag.as_deref(), Some("StoredPlayer"));
+    assert_eq!(
+        loaded.profile_data.as_deref(),
+        Some(r#"{"username":"ProfilePlayer"}"#)
+    );
+    assert_eq!(
+        loaded.minecraft_uuid.as_deref(),
+        Some("123456781234123412341234567890ab")
+    );
+    assert_eq!(loaded.refresh_token, None);
+    drop(connection);
+    std::fs::remove_file(database_path).expect("remove database");
+}
 
 fn global_settings() -> ShellGlobalSettings {
     ShellGlobalSettings {
@@ -361,7 +414,10 @@ fn legacy_virtual_assets_redirect_game_assets_and_session() {
         substituted,
         format!(
             "--assetsDir {} --session token-abc",
-            PathBuf::from("assets-root").join("virtual").join("legacy").display()
+            PathBuf::from("assets-root")
+                .join("virtual")
+                .join("legacy")
+                .display()
         )
     );
 }
@@ -855,7 +911,10 @@ fn iris_pinned_dep_produces_notice_without_excluding_or_downloading() {
     assert_eq!(notice.requiring_project_id, "YL57xq9U");
     assert_eq!(notice.dependency_id, "AANobbMI");
     assert_eq!(notice.kind, DependencyNoticeKind::VersionUnsatisfied);
-    assert!(notice.detail.contains("0.9.1"), "reports the declared version");
+    assert!(
+        notice.detail.contains("0.9.1"),
+        "reports the declared version"
+    );
     // Both mods remain selectable — detection never mutates the selection.
     assert!(selected.contains_key("YL57xq9U") && selected.contains_key("AANobbMI"));
 }
@@ -865,8 +924,10 @@ fn missing_declared_dependency_produces_missing_notice() {
     // A parent requires a project that is NOT in the mod-list at all.
     let parent = version_with_required_dep("parent", "parent-1", "absent-dep", None);
     let parent_versions = vec![parent.clone()];
-    let selected: std::collections::HashMap<String, ModrinthVersion> =
-        parent_versions.iter().map(|v| (v.project_id.clone(), v.clone())).collect();
+    let selected: std::collections::HashMap<String, ModrinthVersion> = parent_versions
+        .iter()
+        .map(|v| (v.project_id.clone(), v.clone()))
+        .collect();
 
     let notices = detect_modrinth_declared_notices(
         &parent_versions,
@@ -885,15 +946,20 @@ fn satisfied_declared_dependency_produces_no_notice() {
     let parent = version_with_required_dep("parent", "parent-1", "AANobbMI", None);
     let sodium = sample_version("AANobbMI", "sodium-0.8.9");
     let parent_versions = vec![parent, sodium];
-    let selected: std::collections::HashMap<String, ModrinthVersion> =
-        parent_versions.iter().map(|v| (v.project_id.clone(), v.clone())).collect();
+    let selected: std::collections::HashMap<String, ModrinthVersion> = parent_versions
+        .iter()
+        .map(|v| (v.project_id.clone(), v.clone()))
+        .collect();
 
     let notices = detect_modrinth_declared_notices(
         &parent_versions,
         &selected,
         &std::collections::HashMap::new(),
     );
-    assert!(notices.is_empty(), "present unpinned dependency yields no notice");
+    assert!(
+        notices.is_empty(),
+        "present unpinned dependency yields no notice"
+    );
 }
 
 #[test]
@@ -921,5 +987,8 @@ fn rso_embedded_incompatible_version_maps_to_version_unsatisfied_notice() {
         dependency_id: Some("sodium".into()),
         detail: "embedded metadata requires 'sodium', which is missing".into(),
     };
-    assert_eq!(fabric_issue_to_notice("Bh37bMuy", &missing).kind, DependencyNoticeKind::Missing);
+    assert_eq!(
+        fabric_issue_to_notice("Bh37bMuy", &missing).kind,
+        DependencyNoticeKind::Missing
+    );
 }

@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -248,20 +248,70 @@ pub fn read_image_as_data_url_command(
 }
 
 fn read_image_as_data_url(root_dir: &Path, path: &str) -> Result<String> {
-    let p = contained_join(root_dir, path)?;
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("png")
-        .to_lowercase();
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "ico" => "image/x-icon",
-        _ => "image/png",
+    // This reads a user-picked icon. The only caller passes the absolute path
+    // returned by the OS file dialog (outside the launcher root), so root
+    // containment does not apply here. Restrict the IPC surface to small,
+    // regular files whose extension and signature identify a supported image.
+    // A launcher-root-relative path is still accepted for callers that supply
+    // one.
+    const MAX_ICON_BYTES: u64 = 16 * 1024 * 1024;
+
+    let candidate = Path::new(path);
+    let resolved = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        contained_join(root_dir, path)?
     };
-    let bytes = fs::read(&p).with_context(|| format!("failed to read image at {}", p.display()))?;
+
+    let ext = resolved
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .context("image path must have a UTF-8 extension")?;
+    let mime = if ext.eq_ignore_ascii_case("png") {
+        "image/png"
+    } else if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+        "image/jpeg"
+    } else if ext.eq_ignore_ascii_case("webp") {
+        "image/webp"
+    } else if ext.eq_ignore_ascii_case("gif") {
+        "image/gif"
+    } else if ext.eq_ignore_ascii_case("ico") {
+        "image/x-icon"
+    } else {
+        bail!("unsupported image type for {}", resolved.display());
+    };
+
+    let metadata = fs::metadata(&resolved)
+        .with_context(|| format!("failed to read image at {}", resolved.display()))?;
+    if !metadata.is_file() {
+        bail!("image path is not a regular file: {}", resolved.display());
+    }
+    if metadata.len() > MAX_ICON_BYTES {
+        bail!(
+            "image at {} is too large ({} bytes; max {})",
+            resolved.display(),
+            metadata.len(),
+            MAX_ICON_BYTES
+        );
+    }
+
+    let bytes = fs::read(&resolved)
+        .with_context(|| format!("failed to read image at {}", resolved.display()))?;
+    let has_expected_signature = match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/x-icon" => bytes.starts_with(&[0, 0, 1, 0]),
+        _ => false,
+    };
+    if !has_expected_signature {
+        bail!(
+            "file contents do not match image type for {}",
+            resolved.display()
+        );
+    }
+
     let b64 = BASE64.encode(&bytes);
     Ok(format!("data:{mime};base64,{b64}"))
 }
@@ -785,10 +835,10 @@ mod tests {
 
     use super::{
         export_modlist_from_root, list_instance_files_from_root, load_modlist_groups_from_root,
-        load_modlist_presentation_from_root, read_image_as_data_url,
-        save_modlist_groups_from_root, save_modlist_presentation_from_root, ExportModlistInput,
-        ModlistGroupLayout, PersistedTag, SaveModlistGroupsInput, SaveModlistPresentationInput,
-        MODLIST_GROUP_LAYOUT_FILENAME, MODLIST_PRESENTATION_FILENAME,
+        load_modlist_presentation_from_root, read_image_as_data_url, save_modlist_groups_from_root,
+        save_modlist_presentation_from_root, ExportModlistInput, ModlistGroupLayout, PersistedTag,
+        SaveModlistGroupsInput, SaveModlistPresentationInput, MODLIST_GROUP_LAYOUT_FILENAME,
+        MODLIST_PRESENTATION_FILENAME,
     };
     use crate::rules::{ModlistPresentation, RULES_FILENAME};
 
@@ -905,8 +955,7 @@ mod tests {
             .join("instances")
             .join("1.21-fabric");
         fs::create_dir_all(&instance_dir).expect("instance directory should exist");
-        fs::write(instance_dir.join("options.txt"), b"safe")
-            .expect("instance file should exist");
+        fs::write(instance_dir.join("options.txt"), b"safe").expect("instance file should exist");
 
         assert!(
             list_instance_files_from_root(&root_dir, "Safe Pack", Some("../../etc")).is_err(),
@@ -917,9 +966,8 @@ mod tests {
             "a mod-list name containing a separator must be rejected"
         );
 
-        let nodes =
-            list_instance_files_from_root(&root_dir, "Safe Pack", Some("1.21-fabric"))
-                .expect("a contained relative path should be listed");
+        let nodes = list_instance_files_from_root(&root_dir, "Safe Pack", Some("1.21-fabric"))
+            .expect("a contained relative path should be listed");
         assert!(nodes.iter().any(|node| node.name == "options.txt"));
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
@@ -932,8 +980,7 @@ mod tests {
             .join("mod-lists")
             .join("Safe Pack")
             .join("instances");
-        fs::create_dir_all(instances_dir.join("profile"))
-            .expect("instance directory should exist");
+        fs::create_dir_all(instances_dir.join("profile")).expect("instance directory should exist");
         fs::write(instances_dir.join("profile").join("options.txt"), b"safe")
             .expect("selected file should exist");
 
@@ -1007,7 +1054,10 @@ mod tests {
             },
         );
 
-        assert!(result.is_err(), "a traversal mod-list name must be rejected");
+        assert!(
+            result.is_err(),
+            "a traversal mod-list name must be rejected"
+        );
         assert!(
             !root_dir.join("unsafe.zip").exists(),
             "validation must happen before creating the archive"
@@ -1062,17 +1112,43 @@ mod tests {
         let image_path = root_dir.join("icons").join("icon.png");
         fs::create_dir_all(image_path.parent().expect("image should have a parent"))
             .expect("image directory should exist");
-        fs::write(&image_path, b"image").expect("image should exist");
+        fs::write(&image_path, b"\x89PNG\r\n\x1a\nimage").expect("image should exist");
 
+        // Root-relative traversal is still rejected (contained_join path).
         assert!(
             read_image_as_data_url(&root_dir, "../outside.png").is_err(),
-            "an image path escaping the launcher root must be rejected"
+            "a relative image path escaping the launcher root must be rejected"
         );
         let data_url = read_image_as_data_url(&root_dir, "icons/icon.png")
             .expect("a launcher-root-relative image should be read");
         assert!(data_url.starts_with("data:image/png;base64,"));
 
+        // The real caller passes the OS dialog's ABSOLUTE path, outside the
+        // launcher root: it must be accepted when it carries an image extension.
+        let outside = unique_test_root();
+        let outside_icon = outside.join("Pictures").join("avatar.jpeg");
+        fs::create_dir_all(outside_icon.parent().expect("parent")).expect("dir");
+        fs::write(&outside_icon, b"\xff\xd8\xffjpegbytes").expect("write");
+        let abs_url = read_image_as_data_url(&root_dir, &outside_icon.to_string_lossy())
+            .expect("an absolute dialog image path must be accepted");
+        assert!(abs_url.starts_with("data:image/jpeg;base64,"));
+
+        // A non-image absolute path (exfiltration attempt) is rejected on ext.
+        let secret = outside.join("secret.txt");
+        fs::write(&secret, b"top secret").expect("write");
+        assert!(
+            read_image_as_data_url(&root_dir, &secret.to_string_lossy()).is_err(),
+            "a non-image absolute path must be rejected by the extension guard"
+        );
+        let disguised_secret = outside.join("secret.png");
+        fs::write(&disguised_secret, b"top secret").expect("write");
+        assert!(
+            read_image_as_data_url(&root_dir, &disguised_secret.to_string_lossy()).is_err(),
+            "an image extension without a matching signature must be rejected"
+        );
+
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+        fs::remove_dir_all(&outside).expect("temporary outside dir should be removable");
     }
 
     #[test]

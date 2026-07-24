@@ -163,6 +163,13 @@ struct AssetObject {
     hash: String,
 }
 
+fn asset_hash_prefix(hash: &str) -> Result<&str> {
+    if hash.len() != 40 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid asset SHA-1 '{hash}'");
+    }
+    Ok(&hash[..2])
+}
+
 // ── OS detection ──────────────────────────────────────────────────────────────
 
 fn current_os_name() -> &'static str {
@@ -684,7 +691,7 @@ async fn ensure_assets(
         .values()
         .map(|obj| {
             let hash = &obj.hash;
-            let prefix = &hash[..2];
+            let prefix = asset_hash_prefix(hash)?;
             let dest = contained_join(objects_dir.as_path(), &format!("{prefix}/{hash}"))?;
             Ok((hash.clone(), dest))
         })
@@ -713,9 +720,8 @@ async fn ensure_assets(
                 let base_url = MC_ASSETS_BASE_URL;
 
                 join_set.spawn(async move {
-                    let prefix = &hash[..2];
-                    let dest =
-                        contained_join(objects_dir.as_path(), &format!("{prefix}/{hash}"))?;
+                    let prefix = asset_hash_prefix(&hash)?;
+                    let dest = contained_join(objects_dir.as_path(), &format!("{prefix}/{hash}"))?;
                     if dest.exists() {
                         return Ok(());
                     }
@@ -755,7 +761,7 @@ fn materialize_virtual_assets(
 
     for (logical_path, object) in &asset_index.objects {
         let hash = &object.hash;
-        let prefix = &hash[..2];
+        let prefix = asset_hash_prefix(hash)?;
         let source = contained_join(objects_dir, &format!("{prefix}/{hash}"))?;
         let dest = contained_join(virtual_root.as_path(), logical_path)?;
 
@@ -878,6 +884,15 @@ mod tests {
             contained_join(libraries_dir, "org/example/library/1.0/library-1.0.jar").unwrap(),
             libraries_dir.join("org/example/library/1.0/library-1.0.jar")
         );
+    }
+
+    #[test]
+    fn asset_hash_prefix_requires_a_sha1() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(asset_hash_prefix(sha1).unwrap(), "01");
+        assert!(asset_hash_prefix("a").is_err());
+        assert!(asset_hash_prefix("../../outside").is_err());
+        assert!(asset_hash_prefix("g123456789abcdef0123456789abcdef01234567").is_err());
     }
 
     #[test]
