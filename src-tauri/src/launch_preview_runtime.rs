@@ -12,11 +12,11 @@ use crate::adoptium::{
     host_adoptium_os, normalize_adoptium_architecture, plan_runtime_download, AdoptiumClient,
 };
 use crate::java_runtime::{
-    discover_java_installations, persist_java_installations, select_java_for_requirement,
-    CommandJavaBinaryInspector, JavaBinaryInspector,
+    discover_java_installations, persist_java_installations, select_exact_java_for_requirement,
+    select_java_for_requirement, CommandJavaBinaryInspector, JavaBinaryInspector,
 };
-use crate::launcher_paths::LauncherPaths;
 use crate::launch_command::PreparedLaunchCommand;
+use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::{
     LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata, LoaderMetadataClient,
 };
@@ -27,9 +27,13 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::artifacts::extract_artifact_name;
 use super::{
-    download_file, emit_log, emit_progress, EffectiveLaunchSettings, LaunchPlaceholders,
-    LoggingProcessEventSink, PlayerIdentity, StartedLaunch, ACTIVE_MC_PID,
+    download_file, emit_launcher_issue, emit_log, emit_progress, EffectiveLaunchSettings,
+    LaunchPlaceholders, LoggingProcessEventSink, PlayerIdentity, StartedLaunch, ACTIVE_MC_PID,
 };
+
+/// Main class of the modern ForgeWrapper installer (Forge 1.13+ and NeoForge).
+/// Legacy Forge (<=1.12.2) instead uses `net.minecraft.launchwrapper.Launch`.
+const FORGE_WRAPPER_MAIN_CLASS: &str = "io.github.zekerzhayard.forgewrapper.installer.Main";
 
 pub(super) async fn materialize_loader_libraries(
     http_client: &reqwest::Client,
@@ -142,6 +146,12 @@ pub(super) struct ForgeWrapperInstallerArtifact {
 pub(super) fn forge_wrapper_installer_artifact(
     loader_metadata: &LoaderMetadata,
 ) -> Result<Option<ForgeWrapperInstallerArtifact>> {
+    // Legacy Forge (<=1.12.2) launches via LaunchWrapper (main class
+    // net.minecraft.launchwrapper.Launch) with a --tweakClass, NOT ForgeWrapper.
+    // Only prepare the wrapper installer for the modern ForgeWrapper main class.
+    if loader_metadata.main_class != FORGE_WRAPPER_MAIN_CLASS {
+        return Ok(None);
+    }
     match loader_metadata.mod_loader {
         ModLoader::Forge => {
             let version = loader_metadata
@@ -177,6 +187,24 @@ pub(super) fn forge_wrapper_installer_artifact(
                 !version.is_empty(),
                 "NeoForge metadata did not include a loader version"
             );
+
+            // NeoForge 1.20.1 (the 47.x fork era) still publishes under the
+            // inherited `net.neoforged:forge` coordinate with an MC-prefixed
+            // version (`1.20.1-47.1.106`). 1.20.2+ (20.2.x / 21.x) switched to
+            // `net.neoforged:neoforge` with a bare loader version.
+            if loader_metadata.minecraft_version == "1.20.1" {
+                let coord = format!("1.20.1-{version}");
+                return Ok(Some(ForgeWrapperInstallerArtifact {
+                    url: format!(
+                        "https://maven.neoforged.net/releases/net/neoforged/forge/{coord}/forge-{coord}-installer.jar"
+                    ),
+                    relative_path: PathBuf::from("net")
+                        .join("neoforged")
+                        .join("forge")
+                        .join(&coord)
+                        .join(format!("forge-{coord}-installer.jar")),
+                }));
+            }
 
             Ok(Some(ForgeWrapperInstallerArtifact {
                 url: format!(
@@ -543,6 +571,33 @@ pub(super) fn build_instance_root(
         )))
 }
 
+pub(super) fn load_active_account_for_launch<S: crate::token_storage::SecretStore>(
+    connection: &Connection,
+    secret_store: S,
+) -> Result<Option<crate::token_storage::PlaintextAccountRecord>> {
+    use crate::microsoft_auth::AccountsRepository;
+    use crate::token_storage::{AccountTokenCipher, PlaintextAccountRecord};
+
+    let Some(account) = AccountsRepository::new(connection).load_active_account()? else {
+        return Ok(None);
+    };
+    let token_cipher = AccountTokenCipher::new(secret_store);
+    let refresh_token = account
+        .refresh_token_enc
+        .as_deref()
+        .and_then(|payload| token_cipher.decrypt_token(payload).ok());
+
+    Ok(Some(PlaintextAccountRecord {
+        microsoft_id: account.microsoft_id,
+        xbox_gamertag: account.xbox_gamertag,
+        minecraft_uuid: account.minecraft_uuid,
+        access_token: None,
+        refresh_token,
+        profile_data: account.profile_data,
+        is_active: account.is_active,
+    }))
+}
+
 pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Result<PlayerIdentity> {
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
         format!(
@@ -551,15 +606,19 @@ pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Resu
         )
     })?;
 
-    // SECURITY (C1): decrypt the active account from the AES-GCM encrypted
-    // columns. profile_data no longer carries tokens. Extract everything BEFORE
-    // async work (Connection is not Send).
-    let raw_account = {
-        use crate::token_storage::{EncryptedAccountsRepository, KeyringSecretStore};
-        EncryptedAccountsRepository::new(&connection, KeyringSecretStore::new())
-            .load_active_account()
-            .ok()
-            .flatten()
+    // SECURITY (C1): profile_data no longer carries tokens. Preserve the
+    // non-secret identity fields even when the OS keyring is unavailable or a
+    // token blob is corrupt; only the refresh token needs decryption here.
+    // Extract everything BEFORE async work (Connection is not Send).
+    let raw_account = match load_active_account_for_launch(
+        &connection,
+        crate::token_storage::KeyringSecretStore::new(),
+    ) {
+        Ok(account) => account,
+        Err(error) => {
+            eprintln!("[Auth] Failed to load active account metadata: {error:#}");
+            None
+        }
     };
     let db_path = launcher_paths.database_path().to_path_buf();
     drop(connection); // Release connection before async work.
@@ -659,15 +718,19 @@ pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Resu
                                         &conn,
                                         KeyringSecretStore::new(),
                                     )
-                                    .upsert_account(&PlaintextAccountRecord {
-                                        microsoft_id: microsoft_id.clone(),
-                                        xbox_gamertag: raw.xbox_gamertag.clone(),
-                                        minecraft_uuid: Some(login.minecraft_uuid.clone()),
-                                        access_token: Some(login.minecraft_access_token.clone()),
-                                        refresh_token: Some(rotated_refresh),
-                                        profile_data: Some(new_profile),
-                                        is_active: true,
-                                    });
+                                    .upsert_account(
+                                        &PlaintextAccountRecord {
+                                            microsoft_id: microsoft_id.clone(),
+                                            xbox_gamertag: raw.xbox_gamertag.clone(),
+                                            minecraft_uuid: Some(login.minecraft_uuid.clone()),
+                                            access_token: Some(
+                                                login.minecraft_access_token.clone(),
+                                            ),
+                                            refresh_token: Some(rotated_refresh),
+                                            profile_data: Some(new_profile),
+                                            is_active: true,
+                                        },
+                                    );
                                 }
 
                                 return Ok(PlayerIdentity {
@@ -742,17 +805,39 @@ pub(super) async fn select_or_download_java(
     })?;
     persist_java_installations(&connection, &installations)?;
 
-    if let Some(installation) = select_java_for_requirement(&installations, required_version) {
+    // Exact installed match wins: preserves legacy exact-major behavior and
+    // avoids substituting when the precise runtime is already present.
+    if let Some(installation) = select_exact_java_for_requirement(&installations, required_version)
+    {
         return Ok(installation.path);
     }
 
-    // No suitable Java found; auto-download via Adoptium.
+    let adoptium = AdoptiumClient::new();
+    let os = host_adoptium_os();
+    let arch = normalize_adoptium_architecture(std::env::consts::ARCH);
+
+    // Resolve the nearest major Adoptium actually ships. EOL majors (e.g. Java
+    // 16) return an empty asset list, so this walks upward to the next
+    // available major (16 -> 17).
+    let (effective_version, package) =
+        resolve_downloadable_java_package(&adoptium, required_version, os, arch).await?;
+
+    if effective_version != required_version {
+        emit_java_substitution_notice(app_handle, required_version, effective_version)?;
+        // The substitute major may already be installed from an earlier launch.
+        if let Some(installation) =
+            select_exact_java_for_requirement(&installations, effective_version)
+        {
+            return Ok(installation.path);
+        }
+    }
+
     emit_log(
         app_handle,
         ProcessLogStream::Stdout,
         format!(
-            "[Java] No Java {} found, downloading from Adoptium...",
-            required_version
+            "[Java] No Java {} found, downloading Java {} from Adoptium...",
+            required_version, effective_version
         ),
     )?;
     emit_progress(
@@ -760,26 +845,12 @@ pub(super) async fn select_or_download_java(
         "resolving",
         85,
         "Downloading Java",
-        &format!("Fetching Java {} runtime from Adoptium.", required_version),
+        &format!("Fetching Java {} runtime from Adoptium.", effective_version),
     )?;
-
-    let adoptium = AdoptiumClient::new();
-    let os = host_adoptium_os();
-    let arch = normalize_adoptium_architecture(std::env::consts::ARCH);
-
-    let package = adoptium
-        .fetch_latest_jre_package(required_version, os, arch)
-        .await?
-        .with_context(|| {
-            format!(
-                "Adoptium has no JRE {} for {}/{}",
-                required_version, os, arch
-            )
-        })?;
 
     let plan = plan_runtime_download(
         launcher_paths.java_runtimes_dir(),
-        required_version,
+        effective_version,
         package,
         os,
         arch,
@@ -798,25 +869,12 @@ pub(super) async fn select_or_download_java(
     )?;
     let archive_path = plan.archive_path.clone();
     let install_dir = plan.install_dir.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let file = std::fs::File::open(&archive_path)
-            .with_context(|| format!("failed to open Java archive {}", archive_path.display()))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .with_context(|| format!("failed to read Java archive {}", archive_path.display()))?;
-        archive.extract(&install_dir).with_context(|| {
-            format!(
-                "failed to extract Java archive to {}",
-                install_dir.display()
-            )
-        })?;
-        // Clean up archive file.
-        let _ = std::fs::remove_file(&archive_path);
-        Ok(())
-    })
-    .await
-    .context("Java extraction task panicked")??;
+    tokio::task::spawn_blocking(move || extract_java_archive(&archive_path, &install_dir))
+        .await
+        .context("Java extraction task panicked")??;
 
-    // Re-scan and select.
+    // Re-scan and select nearest-higher, so a substituted major satisfies the
+    // original requirement.
     let installations = discover_java_installations(launcher_paths.java_runtimes_dir())?;
     persist_java_installations(&connection, &installations)?;
 
@@ -825,10 +883,119 @@ pub(super) async fn select_or_download_java(
         .with_context(|| {
             format!(
                 "Java {} was downloaded but could not be found after extraction. Check {}",
-                required_version,
+                effective_version,
                 launcher_paths.java_runtimes_dir().display()
             )
         })
+}
+
+/// Find the nearest major >= `required_version` that Adoptium actually ships a
+/// JRE for, returning the resolved major and its latest package. Adoptium
+/// serves an empty asset list for EOL majors (e.g. Java 16), so this walks
+/// upward a bounded number of steps before giving up.
+async fn resolve_downloadable_java_package(
+    adoptium: &AdoptiumClient,
+    required_version: u32,
+    os: &str,
+    arch: &str,
+) -> Result<(u32, crate::adoptium::AdoptiumPackage)> {
+    const MAX_LOOKAHEAD: u32 = 6;
+    for candidate in required_version..=required_version + MAX_LOOKAHEAD {
+        if let Some(package) = adoptium
+            .fetch_latest_jre_package(candidate, os, arch)
+            .await?
+        {
+            return Ok((candidate, package));
+        }
+    }
+    bail!(
+        "Adoptium has no JRE for Java {} or the next {} majors ({}/{})",
+        required_version,
+        MAX_LOOKAHEAD,
+        os,
+        arch
+    )
+}
+
+/// Inform the user that the exact Java major was unavailable and a higher major
+/// was substituted. Non-blocking, in line with the launcher's "inform, don't
+/// silently decide" design.
+fn emit_java_substitution_notice(
+    app_handle: &tauri::AppHandle,
+    required_version: u32,
+    effective_version: u32,
+) -> Result<()> {
+    emit_launcher_issue(
+        app_handle,
+        "Java version substituted",
+        &format!(
+            "Java {required_version} is unavailable for download; using Java {effective_version} instead."
+        ),
+        &format!(
+            "This Minecraft version targets Java {required_version}, which Adoptium no longer distributes (end-of-life). The launcher selected the nearest available runtime, Java {effective_version}. If you hit issues, install Java {required_version} manually and set a Java override in settings."
+        ),
+        "warning",
+        "launch",
+    )
+}
+
+/// Extract a downloaded JRE archive into `install_dir`, dispatching on the
+/// archive format by extension.
+///
+/// Adoptium ships `.tar.gz` on Linux/macOS and `.zip` on Windows. The tar path
+/// preserves the unix mode bits stored in the archive, so the extracted `java`
+/// binary keeps its executable permission; the previous zip-only code failed
+/// outright on the `.tar.gz` archives (`invalid Zip archive`), making the first
+/// launch impossible on unix. The archive file is removed after a successful
+/// extraction.
+fn extract_java_archive(archive_path: &Path, install_dir: &Path) -> Result<()> {
+    let name = archive_path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        extract_tar_gz(archive_path, install_dir)?;
+    } else if name.ends_with(".zip") {
+        extract_zip(archive_path, install_dir)?;
+    } else {
+        bail!(
+            "unsupported Java archive format for {} (expected .tar.gz or .zip)",
+            archive_path.display()
+        );
+    }
+
+    let _ = std::fs::remove_file(archive_path);
+    Ok(())
+}
+
+fn extract_tar_gz(archive_path: &Path, install_dir: &Path) -> Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("failed to open Java archive {}", archive_path.display()))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    // Preserve the mode bits recorded in the tar entries so the extracted
+    // `bin/java` retains its executable permission.
+    archive.set_preserve_permissions(true);
+    archive.unpack(install_dir).with_context(|| {
+        format!(
+            "failed to extract Java tar.gz archive to {}",
+            install_dir.display()
+        )
+    })
+}
+
+fn extract_zip(archive_path: &Path, install_dir: &Path) -> Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("failed to open Java archive {}", archive_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read Java archive {}", archive_path.display()))?;
+    archive.extract(install_dir).with_context(|| {
+        format!(
+            "failed to extract Java zip archive to {}",
+            install_dir.display()
+        )
+    })
 }
 
 pub(super) fn format_uuid_with_dashes(uuid: &str) -> String {
@@ -879,6 +1046,8 @@ pub(super) fn substitute_known_placeholders(
             "${assets_index_name}",
             placeholders.assets_index_name.as_str(),
         ),
+        ("${game_assets}", placeholders.game_assets.as_str()),
+        ("${auth_session}", placeholders.auth_access_token.as_str()),
         ("${auth_uuid}", placeholders.auth_uuid.as_str()),
         (
             "${auth_access_token}",
@@ -925,7 +1094,10 @@ mod tests {
 
     use zip::write::FileOptions;
 
-    use super::{forge_profile_libraries_from_json, read_forge_installer_profile_libraries};
+    use super::{
+        extract_java_archive, forge_profile_libraries_from_json,
+        read_forge_installer_profile_libraries,
+    };
 
     fn forge_version_json() -> &'static str {
         r#"{
@@ -1011,5 +1183,71 @@ mod tests {
         assert!(libraries
             .iter()
             .any(|library| library.name == "org.apache.logging.log4j:log4j-core:2.15.0"));
+    }
+
+    #[test]
+    fn extract_java_archive_unpacks_tar_gz_preserving_exec_bit() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "cubic-java-extract-{unique}-{}",
+            std::process::id()
+        ));
+        let archive_path = base.with_extension("tar.gz");
+        let install_dir = base.join("install");
+
+        // Build a REAL .tar.gz fixture (not mocked): a bin/java entry with mode
+        // 0o755, mirroring an Adoptium JRE layout.
+        let script = b"#!/bin/sh\necho harness-java\n";
+        {
+            let file = std::fs::File::create(&archive_path).expect("archive create");
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(script.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "jdk-17/bin/java", &script[..])
+                .expect("append java entry");
+            builder
+                .into_inner()
+                .expect("finish tar")
+                .finish()
+                .expect("finish gz");
+        }
+
+        extract_java_archive(&archive_path, &install_dir).expect("tar.gz should extract");
+
+        let extracted = install_dir.join("jdk-17/bin/java");
+        assert!(extracted.exists(), "java binary should be extracted");
+        assert_eq!(
+            std::fs::read(&extracted).expect("read extracted java"),
+            script,
+            "extracted content must match"
+        );
+        // The archive file is removed after a successful extraction.
+        assert!(!archive_path.exists(), "archive should be cleaned up");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&extracted)
+                .expect("stat extracted java")
+                .permissions()
+                .mode();
+            assert_ne!(
+                mode & 0o111,
+                0,
+                "tar extraction must preserve the executable bit (mode={mode:o})"
+            );
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

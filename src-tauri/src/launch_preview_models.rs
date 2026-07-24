@@ -90,6 +90,9 @@ pub(super) struct LaunchPlaceholders {
     pub(super) game_directory: String,
     pub(super) assets_root: String,
     pub(super) assets_index_name: String,
+    /// Legacy `--assetsDir` target: the materialized virtual tree for pre-1.7.3
+    /// versions, otherwise the shared assets root.
+    pub(super) game_assets: String,
     pub(super) auth_uuid: String,
     pub(super) auth_access_token: String,
     pub(super) user_type: String,
@@ -183,6 +186,7 @@ impl LaunchPlaceholders {
         asset_index_id: &str,
         library_directory: &Path,
         natives_directory: &Path,
+        is_virtual_assets: bool,
     ) -> Self {
         Self {
             auth_player_name: player_identity.username.clone(),
@@ -195,6 +199,15 @@ impl LaunchPlaceholders {
             game_directory: game_directory.display().to_string(),
             assets_root: assets_root.display().to_string(),
             assets_index_name: asset_index_id.to_string(),
+            game_assets: if is_virtual_assets {
+                assets_root
+                    .join("virtual")
+                    .join(asset_index_id)
+                    .display()
+                    .to_string()
+            } else {
+                assets_root.display().to_string()
+            },
             auth_uuid: player_identity.uuid.clone(),
             auth_access_token: player_identity.access_token.clone(),
             user_type: player_identity.user_type.clone(),
@@ -231,6 +244,16 @@ fn default_terminate_on_timeout() -> bool {
 }
 
 fn automation_cache_only_override() -> Option<bool> {
+    // S2: only honor CUBIC_AUTOMATION_CACHE_ONLY_MODE when the automation
+    // entry-point is active. This prevents an inherited env value from silently
+    // overriding the user's cache_only_mode in a normal production launch.
+    if std::env::var("CUBIC_AUTOMATION_VERIFY_REQUEST")
+        .ok()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return None;
+    }
     let value = std::env::var("CUBIC_AUTOMATION_CACHE_ONLY_MODE").ok()?;
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "on" => Some(true),
