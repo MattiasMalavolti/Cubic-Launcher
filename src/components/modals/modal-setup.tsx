@@ -1,9 +1,10 @@
 import { For, Show, createEffect, createSignal, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import type { GlobalSettingsState, ModlistOverridesState } from "../../store";
+import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "../../store";
 import {
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
   globalSettings, modlistOverrides,
+  updateCheckState, setUpdateCheckState, setUpdateInfo,
   accountsModalOpen, setAccountsModalOpen, accounts, setAccounts, activeAccountId, setActiveAccountId, activeAccount,
   toggleActiveAccountConnection,
   instancePresentationOpen, setInstancePresentationOpen,
@@ -15,6 +16,7 @@ import {
   selectedModListName,
 } from "../../store";
 import { Modal, ModalHeader } from "./modal-base";
+const isTauriEnv = () => "__TAURI_INTERNALS__" in window;
 
 export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
   return (
@@ -62,15 +64,58 @@ export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
 export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState, modlistDraft: ModlistOverridesState) => Promise<void> }) {
   const [globalDraft, setGlobalDraft] = createSignal<GlobalSettingsState>({ ...globalSettings() });
   const [modlistDraft, setModlistDraft] = createSignal<ModlistOverridesState>({ ...modlistOverrides() });
+  const [lastUpdateCheck, setLastUpdateCheck] = createSignal<UpdateCheckResponse | null>(null);
 
   createEffect(on(settingsModalOpen, open => {
     if (!open) return;
     setGlobalDraft({ ...globalSettings() });
     setModlistDraft({ ...modlistOverrides() });
     setSettingsTab("global");
+    setLastUpdateCheck(null);
+    setUpdateCheckState("idle");
   }));
 
   const handleCancel = () => setSettingsModalOpen(false);
+  const handleCheckForUpdates = async () => {
+    if (!isTauriEnv() || updateCheckState() === "checking") return;
+
+    setUpdateCheckState("checking");
+    setLastUpdateCheck(null);
+    try {
+      const result = await invoke<UpdateCheckResponse>("check_for_updates");
+      setLastUpdateCheck(result);
+
+      if (result.status === "available" && result.version) {
+        setUpdateInfo({
+          version: result.version,
+          notes: result.notes,
+          currentVersion: result.currentVersion,
+        });
+        setUpdateCheckState("available");
+        return;
+      }
+
+      if (result.status === "upToDate") {
+        setUpdateCheckState("upToDate");
+        return;
+      }
+
+      setUpdateCheckState("error");
+    } catch {
+      setLastUpdateCheck(null);
+      setUpdateCheckState("error");
+    }
+  };
+
+  const updateCheckMessage = () => {
+    const state = updateCheckState();
+    const result = lastUpdateCheck();
+    if (state === "checking") return "Checking for updates...";
+    if (state === "available" && result?.version) return `Version ${result.version} available`;
+    if (state === "upToDate" && result) return `You're up to date (v${result.currentVersion})`;
+    if (state === "error") return "Could not check for updates";
+    return null;
+  };
 
   const field = (label: string, content: any) => (
     <div class="rounded-md border border-border bg-background p-4">
@@ -124,6 +169,25 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                 {field("Custom JVM Args", <textarea rows={3} value={globalDraft().customJvmArgs} onInput={e => setGlobalDraft(c => ({ ...c, customJvmArgs: e.currentTarget.value }))} class="w-full resize-none rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
                 {field("Java Path Override", <input type="text" value={globalDraft().javaPathOverride} onInput={e => setGlobalDraft(c => ({ ...c, javaPathOverride: e.currentTarget.value }))} placeholder="Optional explicit Java binary path" class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
                 {field("Wrapper Command (Linux)", <input type="text" value={globalDraft().wrapperCommand} onInput={e => setGlobalDraft(c => ({ ...c, wrapperCommand: e.currentTarget.value }))} placeholder="gamemoderun mangohud" class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
+                {field("Updates",
+                  <div class="space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleCheckForUpdates()}
+                      disabled={!isTauriEnv() || updateCheckState() === "checking"}
+                      class="rounded-md bg-secondary px-3 py-1.5 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {updateCheckState() === "checking" ? "Checking..." : "Check for updates"}
+                    </button>
+                    <Show when={updateCheckMessage()}>
+                      {message => (
+                        <p class={`text-xs ${updateCheckState() === "error" ? "text-destructive" : updateCheckState() === "available" ? "text-primary" : "text-muted-foreground"}`}>
+                          {message()}
+                        </p>
+                      )}
+                    </Show>
+                  </div>
+                )}
                 <div>
                   <label class="flex items-center gap-3 text-sm">
                     <input type="checkbox" checked={globalDraft().profilerEnabled} onChange={e => setGlobalDraft(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
@@ -255,7 +319,6 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
   );
 }
 
-const isTauriEnv = () => "__TAURI_INTERNALS__" in window;
 
 export function InstancePresentationModal(props: { onSave: () => Promise<void>; onDelete: () => Promise<void> }) {
   const [draft, setDraft] = createSignal({ ...instancePresentation() });

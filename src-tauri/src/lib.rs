@@ -28,6 +28,7 @@ pub mod process_streaming;
 pub mod resolver;
 pub mod rules;
 pub mod token_storage;
+mod updater;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -72,6 +73,8 @@ pub fn run() {
         })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             app_shell::load_shell_snapshot_command,
             app_shell::switch_active_account_command,
@@ -117,7 +120,9 @@ pub fn run() {
             content_packs::save_content_version_rules_command,
             launch_preview::start_launch_command,
             launch_preview::verify_launch_command,
-            launch_preview::stop_minecraft_command
+            launch_preview::stop_minecraft_command,
+            updater::check_for_updates,
+            updater::install_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

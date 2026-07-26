@@ -22,6 +22,18 @@ import type {
 import { LAUNCH_STAGES } from "./lib/types";
 
 export { LAUNCH_STAGES } from "./lib/types";
+export type UpdateInfo = {
+  version: string;
+  notes: string | null;
+  currentVersion: string;
+};
+export type UpdateCheckState = "idle" | "checking" | "upToDate" | "available" | "error";
+export type UpdateCheckResponse = {
+  status: "upToDate" | "available" | "error";
+  currentVersion: string;
+  version: string | null;
+  notes: string | null;
+};
 
 export const DEMO_MOD_LISTS: ModListCard[] = [
   { name: "My First Pack", status: "Ready", accent: "from-primary/30 via-primary/10 to-transparent", description: "Create a mod list by clicking + above." },
@@ -58,6 +70,9 @@ export const [launchLogs, setLaunchLogs] = createSignal<string[]>([]);
 export const [logViewerOpen, setLogViewerOpen] = createSignal(false);
 export const [downloadItems, setDownloadItems] = createSignal<DownloadProgressItem[]>([]);
 export const [launcherErrors, setLauncherErrors] = createSignal<LauncherUiError[]>([]);
+export const [updateInfo, setUpdateInfo] = createSignal<UpdateInfo | null>(null);
+export const [updateBusy, setUpdateBusy] = createSignal(false);
+export const [updateCheckState, setUpdateCheckState] = createSignal<UpdateCheckState>("idle");
 export const [errorCenterOpen, setErrorCenterOpen] = createSignal(false);
 export const [accountsModalOpen, setAccountsModalOpen] = createSignal(false);
 export const [accounts, setAccounts] = createSignal<AccountSummary[]>([]);
