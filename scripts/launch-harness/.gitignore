@@ -1,2 +1,6 @@
 reports/
 __pycache__/
+# Harness test outputs written at the harness root must never be committed.
+MATRIX-GREEN-REPORT.md
+*-REPORT.md
+matrix-report.*
