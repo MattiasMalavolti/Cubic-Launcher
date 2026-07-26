@@ -5,7 +5,7 @@
 // `src/app/`, `src/store-*`, or colocated component folders instead of growing
 // this file again.
 
-import { batch } from "solid-js";
+import { batch, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { appendDebugTrace } from "./lib/debugTrace";
 import { logger } from "./lib/logger";
@@ -33,10 +33,11 @@ import {
   alternativesPanelParent, setAlternativesPanelParentId,
   setAdvancedPanelModId, rowMap, setOnToggleEnabled,
   launchState, selectedModList,
+  setUpdateInfo,
   LAUNCH_STAGES, wait,
 } from "./store";
 import { normalizeModLoader, type ModRow } from "./lib/types";
-import type { GlobalSettingsState, ModlistOverridesState } from "./store";
+import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "./store";
 import {
   buildIdRemap,
   collectRowIds,
@@ -64,6 +65,7 @@ import {
 import { useAppBootstrap } from "./app/use-app-bootstrap";
 import { useAppPersistence } from "./app/persistence-effects";
 import { Header } from "./components/Header";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { Sidebar } from "./components/Sidebar";
 import { ModListEditor } from "./components/ModListEditor";
 import { bumpContentVersion, seedContentName } from "./components/mod-list-editor/ContentTabView";
@@ -94,6 +96,24 @@ export default function App() {
   useAppBootstrap({ primePersistenceState });
 
   // ── Startup ────────────────────────────────────────────────────────────────
+  onMount(() => {
+    if (!isTauri()) return;
+
+    void (async () => {
+      try {
+        const result = await invoke<UpdateCheckResponse>("check_for_updates");
+        if (result.status === "available" && result.version) {
+          setUpdateInfo({
+            version: result.version,
+            notes: result.notes,
+            currentVersion: result.currentVersion,
+          });
+        }
+      } catch {
+        // Startup update checks are intentionally silent.
+      }
+    })();
+  });
 
 
       // ── Register Tauri event listeners ──────────────────────────────────
@@ -828,6 +848,7 @@ export default function App() {
     <div class="flex flex-col h-screen w-screen overflow-hidden text-textMain bg-bgDark font-sans">
       {/* Header - Fixed at top */}
       <Header />
+      <UpdateBanner />
 
       {/* Main content area - Sidebar + Content + BottomBar */}
       <div class="flex flex-1 overflow-hidden relative">

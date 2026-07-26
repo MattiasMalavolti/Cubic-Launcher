@@ -1,6 +1,7 @@
 import { createSignal } from "solid-js";
 import { pushUiError, setSettingsModalOpen } from "../store";
 import { MaterialIcon } from "./icons";
+import logoUrl from "../../assets/icon.png";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -39,9 +40,7 @@ export function Header() {
   return (
     <header data-tauri-drag-region class="h-14 border-b border-borderColor bg-bgPanel flex items-center justify-between px-4 shrink-0 z-10 w-full">
       <div class="flex items-center gap-3">
-        <div class="w-8 h-8 rounded-lg bg-primary flex items-center justify-center text-white font-bold text-lg">
-          C
-        </div>
+        <img src={logoUrl} alt="Cubic Launcher" class="w-8 h-8 select-none" draggable={false} />
         <h1 class="font-semibold text-lg tracking-wide text-white/90">Cubic Launcher</h1>
       </div>
       <div class="flex items-center gap-4 text-textMuted">
