@@ -2,6 +2,7 @@ import { For, Show, createSignal } from "solid-js";
 import { versionRules, addVersionRule, removeVersionRule, updateVersionRule } from "../../store";
 import { minecraftVersions, mcWithSnapshots, showSnapshots, setShowSnapshots } from "../../store";
 import { MaterialIcon, XIcon } from "../icons";
+import { Select } from "../Select";
 import { ALL_LOADERS, SectionHeader } from "./shared";
 
 export function VersionRulesSection(props: { modId: string }) {
@@ -25,31 +26,30 @@ export function VersionRulesSection(props: { modId: string }) {
         <For each={versionRules().filter(rule => rule.modId === props.modId)}>
           {rule => (
             <div class="flex flex-wrap items-center gap-2 rounded-md border border-border bg-background p-2">
-              <select
+              <Select
                 value={rule.kind}
-                onChange={e => updateVersionRule(rule.id, { kind: e.currentTarget.value as "exclude" | "only" })}
+                options={[
+                  { value: "exclude", label: "Exclude when" },
+                  { value: "only", label: "Only when" },
+                ]}
+                onChange={value => updateVersionRule(rule.id, { kind: value as "exclude" | "only" })}
                 class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-              >
-                <option value="exclude">Exclude when</option>
-                <option value="only">Only when</option>
-              </select>
-              <select
+              />
+              <Select
                 value={rule.mcVersions[0] ?? ""}
-                onChange={e => updateVersionRule(rule.id, { mcVersions: e.currentTarget.value ? [e.currentTarget.value] : [] })}
+                options={[
+                  { value: "", label: "Any version" },
+                  ...(showSnapshots() ? mcWithSnapshots() : minecraftVersions()).map(version => ({ value: version, label: version })),
+                ]}
+                onChange={value => updateVersionRule(rule.id, { mcVersions: value ? [value] : [] })}
                 class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-              >
-                <option value="">Any version</option>
-                <For each={showSnapshots() ? mcWithSnapshots() : minecraftVersions()}>
-                  {version => <option value={version}>{version}</option>}
-                </For>
-              </select>
-              <select
+              />
+              <Select
                 value={rule.loader}
-                onChange={e => updateVersionRule(rule.id, { loader: e.currentTarget.value })}
+                options={ALL_LOADERS.map(loader => ({ value: loader, label: loader === "any" ? "Any loader" : loader }))}
+                onChange={value => updateVersionRule(rule.id, { loader: value })}
                 class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-              >
-                <For each={ALL_LOADERS}>{loader => <option value={loader}>{loader === "any" ? "Any loader" : loader}</option>}</For>
-              </select>
+              />
               <button
                 onClick={() => removeVersionRule(rule.id)}
                 class="ml-auto flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
@@ -63,31 +63,30 @@ export function VersionRulesSection(props: { modId: string }) {
         <Show when={addingRule()}>
           <div class="rounded-md border border-primary/30 bg-primary/5 p-3 space-y-2">
             <div class="flex flex-wrap gap-2 items-center">
-              <select
+              <Select
                 value={draftKind()}
-                onChange={e => setDraftKind(e.currentTarget.value as "exclude" | "only")}
+                options={[
+                  { value: "exclude", label: "Exclude when" },
+                  { value: "only", label: "Only when" },
+                ]}
+                onChange={value => setDraftKind(value as "exclude" | "only")}
                 class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-              >
-                <option value="exclude">Exclude when</option>
-                <option value="only">Only when</option>
-              </select>
-              <select
+              />
+              <Select
                 value={draftVersions()[0] ?? ""}
-                onChange={e => setDraftVersions(e.currentTarget.value ? [e.currentTarget.value] : [])}
+                options={[
+                  { value: "", label: "Any version" },
+                  ...(showSnapshots() ? mcWithSnapshots() : minecraftVersions()).map(version => ({ value: version, label: version })),
+                ]}
+                onChange={value => setDraftVersions(value ? [value] : [])}
                 class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-              >
-                <option value="">Any version</option>
-                <For each={showSnapshots() ? mcWithSnapshots() : minecraftVersions()}>
-                  {version => <option value={version}>{version}</option>}
-                </For>
-              </select>
-              <select
+              />
+              <Select
                 value={draftLoader()}
-                onChange={e => setDraftLoader(e.currentTarget.value)}
+                options={ALL_LOADERS.map(loader => ({ value: loader, label: loader === "any" ? "Any loader" : loader }))}
+                onChange={value => setDraftLoader(value)}
                 class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-              >
-                <For each={ALL_LOADERS}>{loader => <option value={loader}>{loader === "any" ? "Any loader" : loader}</option>}</For>
-              </select>
+              />
             </div>
             <div class="flex gap-2">
               <button

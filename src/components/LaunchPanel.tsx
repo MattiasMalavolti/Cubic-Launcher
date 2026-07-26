@@ -10,6 +10,7 @@ import {
   activeAccount, accounts, setAccountsModalOpen,
 } from "../store";
 import { MaterialIcon, Loader2Icon, XIcon } from "./icons";
+import { Select } from "./Select";
 
 interface LaunchPanelProps {
   onLaunch: () => void;
@@ -237,27 +238,23 @@ export function LaunchPanel(props: LaunchPanelProps) {
           <div class="hidden md:flex flex-col">
             <div class="flex items-center gap-2 text-sm text-textMain font-medium">
               <MaterialIcon name="extension" size="sm" class="opacity-70" />
-              <select
+              <Select
                 value={selectedModLoader()}
-                onChange={e => { props.onLoaderChange ? props.onLoaderChange(e.currentTarget.value) : setSelectedModLoader(e.currentTarget.value); }}
-                class="bg-transparent border-none text-sm text-textMain font-medium focus:outline-none cursor-pointer"
-              >
-                <For each={MOD_LOADERS as unknown as string[]}>
-                  {l => <option value={l} class="bg-bgPanel">{l} Loader</option>}
-                </For>
-              </select>
+                options={(MOD_LOADERS as unknown as string[]).map(l => ({ value: l, label: `${l} Loader` }))}
+                onChange={value => { props.onLoaderChange ? props.onLoaderChange(value) : setSelectedModLoader(value); }}
+                class="text-sm text-textMain font-medium"
+                direction="up"
+              />
             </div>
             <div class="flex items-center gap-1">
               <span class="text-xs text-textMuted">Minecraft</span>
-              <select
+              <Select
                 value={selectedMcVersion()}
-                onChange={e => { props.onVersionChange ? props.onVersionChange(e.currentTarget.value) : setSelectedMcVersion(e.currentTarget.value); }}
-                class="bg-transparent border-none text-xs text-textMuted focus:outline-none cursor-pointer"
-              >
-                <For each={showSnapshots() ? mcWithSnapshots() : minecraftVersions()}>
-                  {v => <option value={v} class="bg-bgPanel">{v}</option>}
-                </For>
-              </select>
+                options={(showSnapshots() ? mcWithSnapshots() : minecraftVersions()).map(v => ({ value: v, label: v }))}
+                onChange={value => { props.onVersionChange ? props.onVersionChange(value) : setSelectedMcVersion(value); }}
+                class="text-xs text-textMuted"
+                direction="up"
+              />
             </div>
             <label class="flex items-center gap-1 cursor-pointer select-none">
               <input

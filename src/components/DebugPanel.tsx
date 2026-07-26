@@ -1,5 +1,6 @@
 import { createSignal, For, Show } from "solid-js";
 import { logEntries, logger, type LogLevel } from "../lib/logger";
+import { Select } from "./Select";
 
 type FilterLevel = "all" | LogLevel;
 
@@ -79,25 +80,18 @@ export function DebugPanel() {
             }}
           >
             <span style={{ color: "#cdd6f4", "font-size": "13px", "font-weight": "600" }}>🪲 Logs</span>
-            <select
+            <Select
               value={filter()}
-              onChange={e => setFilter(e.currentTarget.value as FilterLevel)}
-              style={{
-                "margin-left": "auto",
-                background: "#313244",
-                color: "#cdd6f4",
-                border: "1px solid #45475a",
-                "border-radius": "4px",
-                padding: "2px 6px",
-                "font-size": "12px",
-              }}
-            >
-              <option value="all">All</option>
-              <option value="debug">debug+</option>
-              <option value="info">info+</option>
-              <option value="warn">warn+</option>
-              <option value="error">error</option>
-            </select>
+              options={[
+                { value: "all", label: "All" },
+                { value: "debug", label: "debug+" },
+                { value: "info", label: "info+" },
+                { value: "warn", label: "warn+" },
+                { value: "error", label: "error" },
+              ]}
+              onChange={value => setFilter(value as FilterLevel)}
+              class="ml-auto rounded border border-[#45475a] bg-[#313244] px-1.5 py-0.5 text-xs text-[#cdd6f4]"
+            />
             <button
               onClick={() => logger.clear()}
               style={{

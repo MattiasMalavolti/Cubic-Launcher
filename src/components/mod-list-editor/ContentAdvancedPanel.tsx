@@ -8,6 +8,7 @@ import {
   setShowSnapshots,
 } from "../../store";
 import { MaterialIcon, XIcon } from "../icons";
+import { Select } from "../Select";
 import type { ContentEntry } from "./content-types";
 
 interface ContentAdvancedPanelProps {
@@ -91,47 +92,51 @@ export function ContentAdvancedPanel(props: ContentAdvancedPanelProps) {
             <For each={rules()}>
               {(rule, index) => (
                 <div class="flex flex-wrap items-center gap-2 rounded-md border border-border bg-background p-2">
-                  <select
+                  <Select
                     value={rule.kind}
-                    onChange={event => {
+                    options={[
+                      { value: "exclude", label: "Exclude when" },
+                      { value: "only", label: "Only when" },
+                    ]}
+                    onChange={value => {
                       const updated = rules().map((candidate, candidateIndex) =>
-                        candidateIndex === index() ? { ...candidate, kind: event.currentTarget.value } : candidate
+                        candidateIndex === index() ? { ...candidate, kind: value } : candidate
                       );
                       setRules(updated);
                       void save(updated);
                     }}
                     class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-                  >
-                    <option value="exclude">Exclude when</option>
-                    <option value="only">Only when</option>
-                  </select>
-                  <select
+                  />
+                  <Select
                     value={rule.mcVersions[0] ?? ""}
-                    onChange={event => {
+                    options={[
+                      { value: "", label: "Any version" },
+                      ...versions().map(version => ({ value: version, label: version })),
+                    ]}
+                    onChange={value => {
                       const updated = rules().map((candidate, candidateIndex) =>
-                        candidateIndex === index() ? { ...candidate, mcVersions: [event.currentTarget.value] } : candidate
+                        candidateIndex === index() ? { ...candidate, mcVersions: [value] } : candidate
                       );
                       setRules(updated);
                       void save(updated);
                     }}
                     class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-                  >
-                    <option value="">Any version</option>
-                    <For each={versions()}>{version => <option value={version}>{version}</option>}</For>
-                  </select>
-                  <select
+                  />
+                  <Select
                     value={rule.loader}
-                    onChange={event => {
+                    options={allLoaders.map(loader => ({
+                      value: loader,
+                      label: loader === "any" ? "Any loader" : loader,
+                    }))}
+                    onChange={value => {
                       const updated = rules().map((candidate, candidateIndex) =>
-                        candidateIndex === index() ? { ...candidate, loader: event.currentTarget.value } : candidate
+                        candidateIndex === index() ? { ...candidate, loader: value } : candidate
                       );
                       setRules(updated);
                       void save(updated);
                     }}
                     class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-                  >
-                    <For each={allLoaders}>{loader => <option value={loader}>{loader === "any" ? "Any loader" : loader}</option>}</For>
-                  </select>
+                  />
                   <button onClick={() => removeRule(index())} class="ml-auto flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive">
                     <XIcon class="h-3.5 w-3.5" />
                   </button>
@@ -150,17 +155,33 @@ export function ContentAdvancedPanel(props: ContentAdvancedPanelProps) {
             >
               <div class="space-y-2 rounded-md border border-primary/30 bg-primary/5 p-3">
                 <div class="flex flex-wrap items-center gap-2">
-                  <select value={draftKind()} onChange={event => setDraftKind(event.currentTarget.value as "exclude" | "only")} class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground">
-                    <option value="exclude">Exclude when</option>
-                    <option value="only">Only when</option>
-                  </select>
-                  <select value={draftVersions()[0] ?? ""} onChange={event => setDraftVersions(event.currentTarget.value ? [event.currentTarget.value] : [])} class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground">
-                    <option value="">Select version...</option>
-                    <For each={versions()}>{version => <option value={version}>{version}</option>}</For>
-                  </select>
-                  <select value={draftLoader()} onChange={event => setDraftLoader(event.currentTarget.value)} class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground">
-                    <For each={allLoaders}>{loader => <option value={loader}>{loader === "any" ? "Any loader" : loader}</option>}</For>
-                  </select>
+                  <Select
+                    value={draftKind()}
+                    options={[
+                      { value: "exclude", label: "Exclude when" },
+                      { value: "only", label: "Only when" },
+                    ]}
+                    onChange={value => setDraftKind(value as "exclude" | "only")}
+                    class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
+                  />
+                  <Select
+                    value={draftVersions()[0] ?? ""}
+                    options={[
+                      { value: "", label: "Select version..." },
+                      ...versions().map(version => ({ value: version, label: version })),
+                    ]}
+                    onChange={value => setDraftVersions(value ? [value] : [])}
+                    class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
+                  />
+                  <Select
+                    value={draftLoader()}
+                    options={allLoaders.map(loader => ({
+                      value: loader,
+                      label: loader === "any" ? "Any loader" : loader,
+                    }))}
+                    onChange={value => setDraftLoader(value)}
+                    class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
+                  />
                 </div>
                 <div class="flex items-center gap-2">
                   <label class="cursor-pointer flex items-center gap-1.5 text-xs text-muted-foreground">
