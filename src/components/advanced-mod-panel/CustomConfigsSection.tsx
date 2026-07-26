@@ -3,6 +3,7 @@ import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { customConfigs, addCustomConfig, removeCustomConfig, updateCustomConfig } from "../../store";
 import { minecraftVersions } from "../../store";
 import { MaterialIcon, XIcon } from "../icons";
+import { Select } from "../Select";
 import { ALL_LOADERS, isTauri } from "./shared";
 
 export function CustomConfigsSection(props: { modId: string }) {
@@ -38,27 +39,25 @@ export function CustomConfigsSection(props: { modId: string }) {
 
             <div class="flex items-center gap-2">
               <label class="text-xs text-muted-foreground shrink-0">Versions:</label>
-              <select
+              <Select
                 value={cfg.mcVersions[0] ?? ""}
-                onChange={e => updateCustomConfig(cfg.id, { mcVersions: e.currentTarget.value ? [e.currentTarget.value] : [] })}
+                options={[
+                  { value: "", label: "Any version" },
+                  ...minecraftVersions().map(version => ({ value: version, label: version })),
+                ]}
+                onChange={value => updateCustomConfig(cfg.id, { mcVersions: value ? [value] : [] })}
                 class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground flex-1"
-              >
-                <option value="">Any version</option>
-                <For each={minecraftVersions()}>
-                  {version => <option value={version}>{version}</option>}
-                </For>
-              </select>
+              />
             </div>
 
             <div class="flex items-center gap-2">
               <label class="text-xs text-muted-foreground shrink-0">Loader:</label>
-              <select
+              <Select
                 value={cfg.loader}
-                onChange={e => updateCustomConfig(cfg.id, { loader: e.currentTarget.value })}
+                options={ALL_LOADERS.map(loader => ({ value: loader, label: loader === "any" ? "Any loader" : loader }))}
+                onChange={value => updateCustomConfig(cfg.id, { loader: value })}
                 class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-              >
-                <For each={ALL_LOADERS}>{loader => <option value={loader}>{loader === "any" ? "Any loader" : loader}</option>}</For>
-              </select>
+              />
             </div>
 
             <div class="flex items-center gap-2">

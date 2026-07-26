@@ -1,5 +1,6 @@
 import { For } from "solid-js";
 import { MOD_CATEGORIES, MOD_LOADERS_SEARCH, SORT_OPTIONS } from "./shared";
+import { Select } from "../Select";
 
 export function SearchSidebar(props: {
   sortBy: string;
@@ -19,9 +20,12 @@ export function SearchSidebar(props: {
     <div class="w-48 shrink-0 border-r border-border overflow-y-auto p-3 space-y-3">
       <div>
         <h4 class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">Sort by</h4>
-        <select value={props.sortBy} onChange={e => props.setSortBy(e.currentTarget.value)} class="w-full rounded border border-border bg-input px-2 py-1 text-xs text-foreground">
-          <For each={SORT_OPTIONS}>{option => <option value={option.value}>{option.label}</option>}</For>
-        </select>
+        <Select
+          value={props.sortBy}
+          options={SORT_OPTIONS.map(option => ({ value: option.value, label: option.label }))}
+          onChange={value => props.setSortBy(value)}
+          class="w-full rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
+        />
       </div>
 
       <div>
