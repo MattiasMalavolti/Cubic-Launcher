@@ -49,6 +49,8 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Cubic Launcher ${{ github.ref_name }}
-          releaseBody: See the release notes for details.
+          releaseBody: |
+            Fixed: dropdowns on Linux (Wayland/X11) closed instantly — all native selects are now in-DOM dropdowns that work on every compositor and driver.
+            Updates install only after your confirmation.
           releaseDraft: true
           includeUpdaterJson: true
