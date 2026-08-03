@@ -50,8 +50,8 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: Cubic Launcher ${{ github.ref_name }}
           releaseBody: |
-            Fixed: Microsoft login silently fell back to offline mode and could not recover — the rotated refresh token is now stored correctly, and any authentication failure is reported instead of hidden.
-            Fixed: mod version selection now prefers stable releases; alpha and beta builds are only used when a mod publishes nothing else.
+            Fixed: Microsoft login no longer falls back to offline mode silently.
+            Fixed: mod selection now prefers stable releases over alpha and beta builds.
             Updates install only after your confirmation.
           releaseDraft: true
           includeUpdaterJson: true
