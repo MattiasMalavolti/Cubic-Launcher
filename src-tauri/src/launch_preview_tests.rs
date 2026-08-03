@@ -11,7 +11,8 @@ use super::{
     build_top_level_owner_map, contained_loader_library_path, detect_modrinth_declared_notices,
     embedded_min_java_requirement, fabric_dependency_predicates_match, fabric_issue_to_notice,
     filter_minecraft_launch_game_arguments, forge_wrapper_installer_artifact,
-    load_active_account_for_launch, load_modlist, local_mod_jar_path, maven_artifact_relative_path,
+    load_active_account_for_launch_with_diagnostics, load_modlist, local_mod_jar_path,
+    maven_artifact_relative_path,
     merge_minecraft_and_loader_game_arguments, merge_minecraft_and_loader_jvm_arguments,
     minecraft_version_predicate_matches, minimum_java_version_for_predicate, parse_mod_loader,
     relative_loader_library_path, substitute_known_placeholders, validate_content_filename,
@@ -58,9 +59,10 @@ fn launch_account_keeps_identity_when_token_key_is_unavailable() {
         })
         .expect("insert active account");
 
-    let loaded = load_active_account_for_launch(&connection, UnavailableSecretStore)
-        .expect("load active account")
-        .expect("active account");
+    let (loaded, refresh_token_error) =
+        load_active_account_for_launch_with_diagnostics(&connection, UnavailableSecretStore)
+            .expect("load active account");
+    let loaded = loaded.expect("active account");
 
     assert_eq!(loaded.xbox_gamertag.as_deref(), Some("StoredPlayer"));
     assert_eq!(
@@ -72,6 +74,8 @@ fn launch_account_keeps_identity_when_token_key_is_unavailable() {
         Some("123456781234123412341234567890ab")
     );
     assert_eq!(loaded.refresh_token, None);
+    // The unusable credential key must now be reported, not silently swallowed.
+    assert!(refresh_token_error.is_some());
     drop(connection);
     std::fs::remove_file(database_path).expect("remove database");
 }
@@ -580,6 +584,7 @@ fn sample_version(project_id: &str, version_id: &str) -> ModrinthVersion {
         name: format!("{project_id} {version_id}"),
         game_versions: vec!["1.21.5".into()],
         loaders: vec!["fabric".into()],
+        version_type: "release".into(),
         dependencies: Vec::new(),
         files: Vec::new(),
         date_published: "2024-08-15T10:00:00.000Z".into(),

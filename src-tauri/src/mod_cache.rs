@@ -553,6 +553,7 @@ mod tests {
               "project_id": "{project_id}",
               "version_number": "1.0.0",
               "name": "{project_id}",
+              "version_type": "release",
               "game_versions": ["1.21.1"],
               "loaders": ["fabric"],
               "date_published": "2024-08-01T10:00:00.000Z",

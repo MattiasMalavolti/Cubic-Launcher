@@ -305,6 +305,23 @@ impl<'connection> AccountsRepository<'connection> {
 
         Ok(accounts)
     }
+
+    pub fn has_encrypted_account_tokens(&self) -> Result<bool> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM accounts
+                    WHERE access_token_enc IS NOT NULL OR refresh_token_enc IS NOT NULL
+                )
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
 }
 
 pub fn build_authorization_url(
@@ -532,8 +549,8 @@ impl MinecraftAuthChain {
             .send()
             .await
             .context("failed to contact Xbox Live")?
-            .error_for_status()
-            .context("Xbox Live authentication failed")?
+            .error_for_status_with_body("Xbox Live authentication failed")
+            .await?
             .json()
             .await
             .context("failed to parse Xbox Live response")
@@ -557,8 +574,8 @@ impl MinecraftAuthChain {
             .send()
             .await
             .context("failed to contact XSTS")?
-            .error_for_status()
-            .context("XSTS authentication failed")?
+            .error_for_status_with_body("XSTS authentication failed")
+            .await?
             .json()
             .await
             .context("failed to parse XSTS response")

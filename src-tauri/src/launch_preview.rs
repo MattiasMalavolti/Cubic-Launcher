@@ -642,7 +642,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "Authenticating",
         "Refreshing Minecraft session...",
     )?;
-    let player_identity = load_player_identity(&launcher_paths).await?;
+    let player_identity = load_player_identity(&app_handle, &launcher_paths).await?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
