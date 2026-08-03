@@ -50,7 +50,8 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: Cubic Launcher ${{ github.ref_name }}
           releaseBody: |
-            Fixed: dropdowns on Linux (Wayland/X11) closed instantly — all native selects are now in-DOM dropdowns that work on every compositor and driver.
+            Fixed: Microsoft login silently fell back to offline mode and could not recover — the rotated refresh token is now stored correctly, and any authentication failure is reported instead of hidden.
+            Fixed: mod version selection now prefers stable releases; alpha and beta builds are only used when a mod publishes nothing else.
             Updates install only after your confirmation.
           releaseDraft: true
           includeUpdaterJson: true
