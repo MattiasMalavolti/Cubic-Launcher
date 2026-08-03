@@ -13,7 +13,7 @@ use crate::microsoft_auth::{
     configured_microsoft_client_id, run_microsoft_login, AccountsRepository,
 };
 use crate::rules::{ModList, RULES_FILENAME};
-use crate::token_storage::KeyringSecretStore;
+use crate::token_storage::{AccountTokenCipher, KeyringSecretStore, SecretStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShellSnapshot {
@@ -329,7 +329,15 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
 }
 
 fn load_active_account_summary(connection: &Connection) -> Result<Option<ShellActiveAccount>> {
+    load_active_account_summary_with_secret_store(connection, KeyringSecretStore::new())
+}
+
+fn load_active_account_summary_with_secret_store<S: SecretStore>(
+    connection: &Connection,
+    secret_store: S,
+) -> Result<Option<ShellActiveAccount>> {
     let account = AccountsRepository::new(connection).load_active_account()?;
+    let token_cipher = AccountTokenCipher::new(secret_store);
 
     Ok(account.map(|account| {
         // Try to get the Minecraft username from profile_data.
@@ -343,18 +351,23 @@ fn load_active_account_summary(connection: &Connection) -> Result<Option<ShellAc
             let clean_uuid = uuid.replace('-', "");
             format!("https://mc-heads.net/avatar/{clean_uuid}/32")
         });
+        let connected = account
+            .refresh_token_enc
+            .as_deref()
+            .map(|payload| token_cipher.decrypt_token(payload).is_ok())
+            .unwrap_or(false);
 
         ShellActiveAccount {
             microsoft_id: account.microsoft_id,
             xbox_gamertag: mc_username.or(account.xbox_gamertag),
             minecraft_uuid: account.minecraft_uuid,
             avatar_url,
-            status: if account.access_token_enc.is_some() {
+            status: if connected {
                 "online".to_string()
             } else {
                 "offline".to_string()
             },
-            last_mode: if account.access_token_enc.is_some() {
+            last_mode: if connected {
                 "microsoft".to_string()
             } else {
                 "offline".to_string()
@@ -567,9 +580,11 @@ fn replace_modlist_settings(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::env;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rusqlite::{params, Connection};
@@ -577,10 +592,12 @@ mod tests {
     use crate::database::initialize_database;
     use crate::microsoft_auth::{AccountRecord, AccountsRepository};
     use crate::rules::{ModList, ModSource, Rule};
+    use crate::token_storage::{AccountTokenCipher, SecretStore};
 
     use super::{
-        account_profile_data_json, load_shell_snapshot_from_root, save_global_settings,
-        save_modlist_overrides, ShellGlobalSettingsInput, ShellModListOverridesInput,
+        account_profile_data_json, load_active_account_summary_with_secret_store,
+        load_shell_snapshot_from_root, save_global_settings, save_modlist_overrides,
+        ShellGlobalSettingsInput, ShellModListOverridesInput,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -590,6 +607,30 @@ mod tests {
             .as_nanos();
 
         env::temp_dir().join(format!("cubic-launcher-shell-snapshot-test-{timestamp}"))
+    }
+
+    #[derive(Clone, Default)]
+    struct MemorySecretStore {
+        values: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    impl SecretStore for MemorySecretStore {
+        fn get_secret(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self
+                .values
+                .lock()
+                .expect("secret store mutex poisoned")
+                .get(key)
+                .cloned())
+        }
+
+        fn set_secret(&self, key: &str, secret: &str) -> anyhow::Result<()> {
+            self.values
+                .lock()
+                .expect("secret store mutex poisoned")
+                .insert(key.to_string(), secret.to_string());
+            Ok(())
+        }
     }
 
     #[test]
@@ -602,6 +643,52 @@ mod tests {
         assert_eq!(parsed.get("uuid").and_then(|v| v.as_str()), Some("uuid-1"));
         assert!(parsed.get("mc_access_token").is_none());
         assert!(parsed.get("ms_refresh_token").is_none());
+    }
+
+    #[test]
+    fn active_account_status_requires_decryptable_refresh_token() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let secret_store = MemorySecretStore::default();
+        let refresh_token_enc = AccountTokenCipher::new(secret_store.clone())
+            .encrypt_token("refresh-token")
+            .expect("refresh token should encrypt");
+        AccountsRepository::new(&connection)
+            .upsert_account(&AccountRecord {
+                microsoft_id: "account-a".into(),
+                xbox_gamertag: Some("PlayerA".into()),
+                minecraft_uuid: Some("uuid-a".into()),
+                access_token_enc: None,
+                refresh_token_enc: Some(refresh_token_enc),
+                profile_data: None,
+                is_active: true,
+            })
+            .expect("account should insert");
+
+        let connected =
+            load_active_account_summary_with_secret_store(&connection, secret_store.clone())
+                .expect("summary should load")
+                .expect("active account should exist");
+        assert_eq!(connected.status, "online");
+        assert_eq!(connected.last_mode, "microsoft");
+
+        connection
+            .execute(
+                "UPDATE accounts SET refresh_token_enc = ?1 WHERE microsoft_id = ?2",
+                params![vec![1_u8, 2, 3], "account-a"],
+            )
+            .expect("refresh token should corrupt");
+        let disconnected =
+            load_active_account_summary_with_secret_store(&connection, secret_store)
+                .expect("summary should load")
+                .expect("active account should exist");
+        assert_eq!(disconnected.status, "offline");
+        assert_eq!(disconnected.last_mode, "offline");
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
 
     #[test]
@@ -712,7 +799,7 @@ mod tests {
                 .active_account
                 .as_ref()
                 .map(|account| account.status.as_str()),
-            Some("online")
+            Some("offline")
         );
         assert_eq!(snapshot.global_settings.min_ram_mb, 3072);
         assert_eq!(snapshot.global_settings.max_ram_mb, 5120);

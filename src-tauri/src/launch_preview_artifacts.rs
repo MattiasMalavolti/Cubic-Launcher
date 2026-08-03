@@ -32,13 +32,16 @@ pub(super) enum RemoteArtifact {
     Live(ModrinthVersion),
     Cached(ModCacheRecord),
 }
-/// Pick the latest candidate by `date_published` (RFC3339 UTC, so lexicographic
-/// comparison is chronological). Deterministic regardless of the order the
-/// Modrinth API returned the versions in. Candidates are already filtered to the
-/// exact/wildcard-compatible set by `fetch_project_versions`.
-fn select_latest_by_date(mut versions: Vec<ModrinthVersion>) -> Option<ModrinthVersion> {
-    versions.sort_by(|a, b| b.date_published.cmp(&a.date_published));
-    versions.into_iter().next()
+/// Pick the preferred candidate by channel first, then by `date_published`
+/// (RFC3339 UTC, so lexicographic comparison is chronological). Candidates are
+/// already filtered to the exact/wildcard-compatible set by
+/// `fetch_project_versions`.
+fn select_preferred_version(versions: Vec<ModrinthVersion>) -> Option<ModrinthVersion> {
+    versions.into_iter().max_by(|left, right| {
+        left.channel_rank()
+            .cmp(&right.channel_rank())
+            .then_with(|| left.date_published.cmp(&right.date_published))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +123,7 @@ pub(super) async fn prefetch_compatible_versions_for_selected(
             .await
         {
             Ok(candidate_versions) => {
-                if let Some(version) = select_latest_by_date(candidate_versions) {
+                if let Some(version) = select_preferred_version(candidate_versions) {
                     versions.insert(selected.mod_id.clone(), version);
                 }
             }
@@ -451,6 +454,14 @@ mod tests {
     use super::*;
 
     fn test_version(id: &str, date_published: &str) -> ModrinthVersion {
+        test_version_with_channel(id, date_published, "release")
+    }
+
+    fn test_version_with_channel(
+        id: &str,
+        date_published: &str,
+        version_type: &str,
+    ) -> ModrinthVersion {
         ModrinthVersion {
             id: id.into(),
             project_id: "example-project".into(),
@@ -458,6 +469,7 @@ mod tests {
             name: id.into(),
             game_versions: vec!["26.1".into()],
             loaders: vec!["fabric".into()],
+            version_type: version_type.into(),
             dependencies: Vec::new(),
             files: Vec::new(),
             date_published: date_published.into(),
@@ -465,13 +477,53 @@ mod tests {
     }
 
     #[test]
-    fn select_latest_by_date_is_order_independent() {
+    fn select_preferred_version_uses_release_before_newer_beta() {
+        let release = test_version_with_channel(
+            "iris-release",
+            "2025-02-20T00:00:00Z",
+            "release",
+        );
+        let beta =
+            test_version_with_channel("iris-beta", "2026-06-13T00:00:00Z", "beta");
+
+        assert_eq!(
+            select_preferred_version(vec![beta, release.clone()]),
+            Some(release)
+        );
+    }
+
+    #[test]
+    fn select_preferred_version_uses_newest_alpha_when_only_alphas_exist() {
+        let older = test_version_with_channel("c2me-older", "2025-01-01T00:00:00Z", "alpha");
+        let newest =
+            test_version_with_channel("c2me-newest", "2026-06-13T00:00:00Z", "alpha");
+
+        assert_eq!(
+            select_preferred_version(vec![newest.clone(), older]),
+            Some(newest)
+        );
+    }
+
+    #[test]
+    fn select_preferred_version_uses_beta_before_alpha_without_release() {
+        let beta = test_version_with_channel("beta", "2025-01-01T00:00:00Z", "beta");
+        let alpha = test_version_with_channel("alpha", "2026-06-13T00:00:00Z", "alpha");
+
+        assert_eq!(
+            select_preferred_version(vec![alpha, beta.clone()]),
+            Some(beta)
+        );
+    }
+
+    #[test]
+    fn select_preferred_version_is_date_order_independent_within_channel() {
         let january = test_version("january", "2024-01-01T00:00:00Z");
         let june = test_version("june", "2024-06-01T00:00:00Z");
         let march = test_version("march", "2024-03-01T00:00:00Z");
 
-        let first = select_latest_by_date(vec![january.clone(), june.clone(), march.clone()]);
-        let second = select_latest_by_date(vec![march, january, june.clone()]);
+        let first =
+            select_preferred_version(vec![january.clone(), june.clone(), march.clone()]);
+        let second = select_preferred_version(vec![march, january, june.clone()]);
 
         assert_eq!(first, Some(june.clone()));
         assert_eq!(second, Some(june));

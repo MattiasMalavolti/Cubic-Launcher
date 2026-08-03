@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
@@ -71,6 +73,7 @@ pub struct PlaintextAccountRecord {
 pub struct AccountTokenCipher<S> {
     secret_store: S,
     key_id: String,
+    key_creation_blocked: Cell<bool>,
 }
 
 impl<S: SecretStore> AccountTokenCipher<S> {
@@ -78,11 +81,20 @@ impl<S: SecretStore> AccountTokenCipher<S> {
         Self {
             secret_store,
             key_id: TOKEN_KEY_ID.to_string(),
+            key_creation_blocked: Cell::new(false),
         }
     }
 
     pub fn encrypt_token(&self, token: &str) -> Result<Vec<u8>> {
-        let cipher = self.cipher()?;
+        self.encrypt_token_with_key_creation(token, true)
+    }
+
+    fn encrypt_token_with_key_creation(
+        &self,
+        token: &str,
+        create_key_if_missing: bool,
+    ) -> Result<Vec<u8>> {
+        let cipher = self.cipher(create_key_if_missing && !self.key_creation_blocked.get())?;
         let mut nonce_bytes = [0_u8; TOKEN_NONCE_LENGTH];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -99,6 +111,13 @@ impl<S: SecretStore> AccountTokenCipher<S> {
     }
 
     pub fn decrypt_token(&self, payload: &[u8]) -> Result<String> {
+        let cipher = match self.cipher(false) {
+            Ok(cipher) => cipher,
+            Err(error) => {
+                self.key_creation_blocked.set(true);
+                return Err(error);
+            }
+        };
         if payload.len() <= 1 + TOKEN_NONCE_LENGTH {
             bail!("encrypted token payload is too short");
         }
@@ -107,7 +126,6 @@ impl<S: SecretStore> AccountTokenCipher<S> {
             bail!("unsupported encrypted token payload version {}", payload[0]);
         }
 
-        let cipher = self.cipher()?;
         let nonce = Nonce::from_slice(&payload[1..1 + TOKEN_NONCE_LENGTH]);
         let ciphertext = &payload[1 + TOKEN_NONCE_LENGTH..];
         let plaintext = cipher
@@ -117,15 +135,21 @@ impl<S: SecretStore> AccountTokenCipher<S> {
         String::from_utf8(plaintext).context("decrypted account token is not valid UTF-8")
     }
 
-    fn cipher(&self) -> Result<Aes256Gcm> {
-        let key_bytes = self.load_or_create_key()?;
+    fn cipher(&self, create_key_if_missing: bool) -> Result<Aes256Gcm> {
+        let key_bytes = self.load_key(create_key_if_missing)?;
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         Ok(Aes256Gcm::new(key))
     }
 
-    fn load_or_create_key(&self) -> Result<[u8; TOKEN_KEY_LENGTH]> {
+    fn load_key(&self, create_if_missing: bool) -> Result<[u8; TOKEN_KEY_LENGTH]> {
         if let Some(encoded_key) = self.secret_store.get_secret(&self.key_id)? {
             return decode_key_bytes(&encoded_key);
+        }
+
+        if !create_if_missing {
+            bail!(
+                "stored account credential key is unavailable; saved accounts cannot be decrypted and the account must be added again"
+            );
         }
 
         let mut key_bytes = [0_u8; TOKEN_KEY_LENGTH];
@@ -151,6 +175,7 @@ impl<'connection, S: SecretStore> EncryptedAccountsRepository<'connection, S> {
     }
 
     pub fn upsert_account(&self, account: &PlaintextAccountRecord) -> Result<()> {
+        let create_key_if_missing = !self.accounts_repository.has_encrypted_account_tokens()?;
         self.accounts_repository.upsert_account(&AccountRecord {
             microsoft_id: account.microsoft_id.clone(),
             xbox_gamertag: account.xbox_gamertag.clone(),
@@ -158,12 +183,18 @@ impl<'connection, S: SecretStore> EncryptedAccountsRepository<'connection, S> {
             access_token_enc: account
                 .access_token
                 .as_deref()
-                .map(|token| self.token_cipher.encrypt_token(token))
+                .map(|token| {
+                    self.token_cipher
+                        .encrypt_token_with_key_creation(token, create_key_if_missing)
+                })
                 .transpose()?,
             refresh_token_enc: account
                 .refresh_token
                 .as_deref()
-                .map(|token| self.token_cipher.encrypt_token(token))
+                .map(|token| {
+                    self.token_cipher
+                        .encrypt_token_with_key_creation(token, create_key_if_missing)
+                })
                 .transpose()?,
             profile_data: account.profile_data.clone(),
             is_active: account.is_active,
@@ -309,6 +340,134 @@ mod tests {
             .expect("token should decrypt");
 
         assert_eq!(decrypted, "refresh-token-value");
+    }
+
+    #[test]
+    fn encrypting_on_fresh_install_creates_credential_key() {
+        let secret_store = MemorySecretStore::default();
+        let cipher = AccountTokenCipher::new(secret_store.clone());
+
+        let encrypted = cipher
+            .encrypt_token("refresh-token-value")
+            .expect("fresh install should create a credential key");
+
+        assert_eq!(
+            cipher
+                .decrypt_token(&encrypted)
+                .expect("created key should decrypt the token"),
+            "refresh-token-value"
+        );
+        assert_eq!(
+            secret_store
+                .values
+                .lock()
+                .expect("secret store mutex poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn missing_credential_key_does_not_orphan_existing_ciphertext() {
+        let secret_store = MemorySecretStore::default();
+        let encrypted = AccountTokenCipher::new(secret_store.clone())
+            .encrypt_token("refresh-token-value")
+            .expect("token should encrypt");
+        secret_store
+            .values
+            .lock()
+            .expect("secret store mutex poisoned")
+            .clear();
+
+        let cipher = AccountTokenCipher::new(secret_store.clone());
+        let error = cipher
+            .decrypt_token(&encrypted)
+            .expect_err("missing key must not be silently replaced");
+
+        assert!(error
+            .to_string()
+            .contains("saved accounts cannot be decrypted"));
+        let encryption_error = cipher
+            .encrypt_token("replacement-token")
+            .expect_err("cipher must remember that saved ciphertext lost its key");
+        assert!(encryption_error
+            .to_string()
+            .contains("saved accounts cannot be decrypted"));
+        assert!(
+            secret_store
+                .values
+                .lock()
+                .expect("secret store mutex poisoned")
+                .is_empty(),
+            "decrypting existing ciphertext must not create a replacement key"
+        );
+    }
+
+    #[test]
+    fn encrypted_repository_refuses_replacement_key_for_saved_accounts() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let secret_store = MemorySecretStore::default();
+        let repository =
+            EncryptedAccountsRepository::new(&connection, secret_store.clone());
+        let account = PlaintextAccountRecord {
+            microsoft_id: "account-a".into(),
+            xbox_gamertag: Some("PlayerA".into()),
+            minecraft_uuid: Some("uuid-a".into()),
+            access_token: Some("access-before".into()),
+            refresh_token: Some("refresh-before".into()),
+            profile_data: None,
+            is_active: true,
+        };
+        repository
+            .upsert_account(&account)
+            .expect("initial account should store");
+        let original_blob: Vec<u8> = connection
+            .query_row(
+                "SELECT refresh_token_enc FROM accounts WHERE microsoft_id = ?1",
+                ["account-a"],
+                |row| row.get(0),
+            )
+            .expect("stored blob should load");
+        secret_store
+            .values
+            .lock()
+            .expect("secret store mutex poisoned")
+            .clear();
+
+        let error = repository
+            .upsert_account(&PlaintextAccountRecord {
+                access_token: Some("access-after".into()),
+                refresh_token: Some("refresh-after".into()),
+                ..account
+            })
+            .expect_err("saved ciphertext must prevent replacement-key creation");
+
+        assert!(error
+            .to_string()
+            .contains("saved accounts cannot be decrypted"));
+        assert!(
+            secret_store
+                .values
+                .lock()
+                .expect("secret store mutex poisoned")
+                .is_empty(),
+            "failed upsert must not create a replacement key"
+        );
+        let unchanged_blob: Vec<u8> = connection
+            .query_row(
+                "SELECT refresh_token_enc FROM accounts WHERE microsoft_id = ?1",
+                ["account-a"],
+                |row| row.get(0),
+            )
+            .expect("stored blob should remain");
+        assert_eq!(unchanged_blob, original_blob);
+
+        drop(repository);
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
 
     #[test]

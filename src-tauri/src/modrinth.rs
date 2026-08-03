@@ -153,14 +153,17 @@ pub fn sort_versions_by_target_preference(
     target: &ResolutionTarget,
 ) {
     versions.sort_by(|left, right| {
+        // Target compatibility stays ahead of channel so a release for the wrong target cannot win.
         let left_key = (
             game_version_affinity(left, target),
             explicit_version_affinity(left, target),
+            left.channel_rank(),
             &left.date_published,
         );
         let right_key = (
             game_version_affinity(right, target),
             explicit_version_affinity(right, target),
+            right.channel_rank(),
             &right.date_published,
         );
         right_key.cmp(&left_key)
@@ -362,6 +365,23 @@ impl Default for ModrinthClient {
     }
 }
 
+fn default_version_type() -> String {
+    "alpha".to_string()
+}
+
+fn deserialize_version_type<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version_type = Option::<String>::deserialize(deserializer)?;
+    Ok(match version_type {
+        Some(value) if matches!(value.as_str(), "release" | "beta" | "alpha") => value,
+        _ => default_version_type(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ModrinthVersion {
     pub id: String,
@@ -370,6 +390,12 @@ pub struct ModrinthVersion {
     pub name: String,
     pub game_versions: Vec<String>,
     pub loaders: Vec<String>,
+    // Missing or unknown channels default to alpha, keeping unrecognized builds at lowest priority.
+    #[serde(
+        default = "default_version_type",
+        deserialize_with = "deserialize_version_type"
+    )]
+    pub version_type: String,
     #[serde(default)]
     pub dependencies: Vec<ModrinthDependency>,
     #[serde(default)]
@@ -378,6 +404,14 @@ pub struct ModrinthVersion {
 }
 
 impl ModrinthVersion {
+    pub(crate) fn channel_rank(&self) -> u8 {
+        match self.version_type.as_str() {
+            "release" => 2,
+            "beta" => 1,
+            _ => 0,
+        }
+    }
+
     pub fn primary_file(&self) -> Option<&ModrinthFile> {
         self.files
             .iter()
@@ -509,6 +543,7 @@ mod tests {
             "project_id": "sodium",
             "version_number": "0.5.9",
             "name": "Sodium 0.5.9",
+            "version_type": "release",
             "game_versions": ["1.21.1"],
             "loaders": ["fabric"],
             "date_published": "2024-06-01T10:00:00.000Z",
@@ -535,6 +570,7 @@ mod tests {
             "project_id": "sodium",
             "version_number": "0.6.0",
             "name": "Sodium 0.6.0",
+            "version_type": "release",
             "game_versions": ["1.21.1"],
             "loaders": ["fabric"],
             "date_published": "2024-08-01T10:00:00.000Z",
@@ -561,6 +597,7 @@ mod tests {
             "project_id": "sodium",
             "version_number": "0.6.0-neoforge",
             "name": "Sodium NeoForge",
+            "version_type": "release",
             "game_versions": ["1.21.1"],
             "loaders": ["neoforge"],
             "date_published": "2024-09-01T10:00:00.000Z",
@@ -604,6 +641,28 @@ mod tests {
     }
 
     #[test]
+    fn unknown_or_missing_version_type_defaults_to_alpha() {
+        let deserialize = |version_type: Option<&str>| {
+            let mut value = serde_json::json!({
+                "id": "version",
+                "project_id": "project",
+                "version_number": "1.0.0",
+                "name": "Version",
+                "game_versions": ["1.21.1"],
+                "loaders": ["fabric"],
+                "date_published": "2024-06-01T10:00:00.000Z"
+            });
+            if let Some(version_type) = version_type {
+                value["version_type"] = version_type.into();
+            }
+            serde_json::from_value::<ModrinthVersion>(value).expect("version should deserialize")
+        };
+
+        assert_eq!(deserialize(None).version_type, "alpha");
+        assert_eq!(deserialize(Some("snapshot")).version_type, "alpha");
+    }
+
+    #[test]
     fn filters_versions_by_target_loader_and_game_version() {
         let versions: Vec<ModrinthVersion> =
             serde_json::from_str(sample_versions_json()).expect("json should deserialize");
@@ -635,6 +694,22 @@ mod tests {
     }
 
     #[test]
+    fn target_preference_uses_release_before_newer_beta() {
+        let versions: Vec<ModrinthVersion> =
+            serde_json::from_str(sample_versions_json()).expect("json should deserialize");
+        let mut compatible = filter_compatible_versions(&versions, &target());
+        compatible
+            .iter_mut()
+            .find(|version| version.id == "version-new")
+            .expect("new version should exist")
+            .version_type = "beta".into();
+
+        sort_versions_by_target_preference(&mut compatible, &target());
+
+        assert_eq!(compatible[0].id, "version-old");
+    }
+
+    #[test]
     fn prefers_exact_target_line_over_newer_patch_line() {
         let target = ResolutionTarget {
             minecraft_version: "1.21.6".into(),
@@ -648,6 +723,7 @@ mod tests {
                 name: "Future line".into(),
                 game_versions: vec!["1.21.x".into()],
                 loaders: vec!["fabric".into()],
+                version_type: "alpha".into(),
                 dependencies: Vec::new(),
                 files: vec![super::ModrinthFile {
                     hashes: HashMap::new(),
@@ -665,6 +741,7 @@ mod tests {
                 name: "Target line".into(),
                 game_versions: vec!["1.21.x".into()],
                 loaders: vec!["fabric".into()],
+                version_type: "alpha".into(),
                 dependencies: Vec::new(),
                 files: vec![super::ModrinthFile {
                     hashes: HashMap::new(),
