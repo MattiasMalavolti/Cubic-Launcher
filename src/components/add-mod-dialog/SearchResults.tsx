@@ -40,12 +40,6 @@ export function SearchResults(props: {
         />
       </div>
 
-      <Show when={!addModSearch() && !props.searching}>
-        <p class="mb-3 text-xs text-muted-foreground">
-          {props.contentType === "mod" ? "Popular mods" : props.contentType === "resourcepack" ? "Popular resource packs" : props.contentType === "datapack" ? "Popular data packs" : "Popular shaders"} on Modrinth
-        </p>
-      </Show>
-
       <div class="space-y-1.5">
         <For each={props.searchResults}>
           {mod => {
