@@ -22,9 +22,6 @@ export function SearchResults(props: {
     <div class="flex-1 min-h-0 overflow-y-auto p-4">
       <div class="relative mb-3">
         <SearchIcon class="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-        <Show when={props.searching}>
-          <Loader2Icon class="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted-foreground" />
-        </Show>
         <Show when={addModSearch()}>
           <button
             onClick={() => props.setSearch("")}
