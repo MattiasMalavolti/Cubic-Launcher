@@ -188,6 +188,14 @@ const VERSION_TYPE_CASCADE: [&str; 3] = ["release", "beta", "alpha"];
 /// orders of magnitude below the limit, so this never splits a real modlist.
 const MAX_HASHES_PER_UPDATE_REQUEST: usize = 1_000;
 
+/// Same shape of guard as `MAX_HASHES_PER_UPDATE_REQUEST`, for `GET /versions`.
+/// That endpoint puts the id list in the query string, so the wall is the URL
+/// length, not the count (measured 2026-09-07: 3 000 ids / ~33 KB answer
+/// `200`, 3 500 / ~38 KB answer `500`, 4 000 / ~44 KB are refused before a
+/// response). 1 000 ids is ~11 KB, and a 300-mod modlist is ~3,3 KB, so this
+/// never splits a real modlist either.
+const MAX_IDS_PER_VERSIONS_REQUEST: usize = 1_000;
+
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("cubic-launcher/0.1.0 (https://github.com/arius-c/Cubic-Launcher)")
@@ -374,6 +382,57 @@ impl ModrinthClient {
             .with_context(|| format!("failed to deserialize Modrinth version '{version_id}'"))?;
 
         Ok(Some(version))
+    }
+
+    /// Version metadata for a set of version ids, in **one** request instead of
+    /// one `GET /version/{id}` per mod.
+    ///
+    /// Keyed by version id, taken from the payload and not from the request:
+    /// the response is a JSON array whose order does not follow the ids asked
+    /// for (measured 2026-09-07). An id Modrinth does not know is simply
+    /// absent, with `200` — same silence as the bulk hash endpoint. An id that
+    /// is not valid base62 fails the **whole** request with `400`, which is why
+    /// the callers only pass ids Modrinth itself produced.
+    pub async fn fetch_versions_by_ids(
+        &self,
+        version_ids: &[String],
+    ) -> Result<HashMap<String, ModrinthVersion>> {
+        let ids = normalize_version_ids(version_ids);
+        let mut found = HashMap::with_capacity(ids.len());
+
+        for chunk in ids.chunks(MAX_IDS_PER_VERSIONS_REQUEST) {
+            for version in self.get_versions(chunk).await? {
+                found.insert(version.id.clone(), version);
+            }
+        }
+
+        Ok(found)
+    }
+
+    async fn get_versions(&self, version_ids: &[String]) -> Result<Vec<ModrinthVersion>> {
+        let url = build_versions_url(&self.base_url, version_ids)?;
+        let response = send_with_retry(|| self.http_client.get(url.clone()))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query Modrinth metadata for {} versions",
+                    version_ids.len()
+                )
+            })?
+            .error_for_status()
+            .with_context(|| {
+                format!(
+                    "Modrinth returned an error for a {}-version metadata lookup",
+                    version_ids.len()
+                )
+            })?;
+
+        response.json::<Vec<ModrinthVersion>>().await.with_context(|| {
+            format!(
+                "failed to deserialize Modrinth metadata for {} versions",
+                version_ids.len()
+            )
+        })
     }
 
     /// Latest version per sha1 hash for a whole modlist, in **three** requests
@@ -566,6 +625,42 @@ pub fn build_version_url(base_url: &str, version_id: &str) -> Result<Url> {
         .with_context(|| format!("invalid Modrinth base URL '{base_url}'"))
 }
 
+/// `GET /versions?ids=["a","b"]`. The ids travel as a JSON array in the query
+/// string, so this is where the request size comes from — see
+/// `MAX_IDS_PER_VERSIONS_REQUEST`.
+pub fn build_versions_url(base_url: &str, version_ids: &[String]) -> Result<Url> {
+    let sanitized_base_url = base_url.trim_end_matches('/');
+    let mut url = Url::parse(&format!("{sanitized_base_url}/versions"))
+        .with_context(|| format!("invalid Modrinth base URL '{base_url}'"))?;
+    let ids_json = serde_json::to_string(version_ids)?;
+
+    url.query_pairs_mut().append_pair("ids", &ids_json);
+
+    Ok(url)
+}
+
+/// Version ids are base62 and **case-sensitive**, so unlike
+/// `normalize_sha1_hashes` this must not change case. Blanks and duplicates are
+/// dropped: the endpoint deduplicates anyway (measured 2026-09-07, two copies
+/// of one id answer with one object), and a blank id would only lengthen the
+/// URL.
+pub(crate) fn normalize_version_ids(version_ids: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(version_ids.len());
+    let mut seen = HashSet::with_capacity(version_ids.len());
+
+    for version_id in version_ids {
+        let trimmed = version_id.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed) {
+            normalized.push(trimmed.to_string());
+        }
+    }
+
+    normalized
+}
+
 pub fn build_version_files_update_url(base_url: &str) -> Result<Url> {
     let sanitized_base_url = base_url.trim_end_matches('/');
     Url::parse(&format!("{sanitized_base_url}/version_files/update"))
@@ -736,10 +831,10 @@ mod tests {
 
     use super::{
         build_project_versions_url, build_version_files_update_body,
-        build_version_files_update_url, build_version_url, filter_compatible_versions,
-        resolve_hash_cascade, select_latest_compatible_version,
-        sort_versions_by_target_preference, DependencyType, ModrinthVersion,
-        MAX_HASHES_PER_UPDATE_REQUEST,
+        build_version_files_update_url, build_version_url, build_versions_url,
+        filter_compatible_versions, normalize_version_ids, resolve_hash_cascade,
+        select_latest_compatible_version, sort_versions_by_target_preference, DependencyType,
+        ModrinthVersion, MAX_HASHES_PER_UPDATE_REQUEST,
     };
     use crate::resolver::{ModLoader, ResolutionTarget};
 
@@ -838,6 +933,33 @@ mod tests {
             build_version_url("https://api.modrinth.com/v2", "abc123").expect("url should build");
 
         assert_eq!(url.as_str(), "https://api.modrinth.com/v2/version/abc123");
+    }
+
+    #[test]
+    fn builds_modrinth_bulk_versions_url_with_the_ids_as_a_json_array() {
+        let url = build_versions_url(
+            "https://api.modrinth.com/v2",
+            &["abc123".to_string(), "def456".to_string()],
+        )
+        .expect("url should build");
+
+        assert_eq!(
+            url.as_str(),
+            "https://api.modrinth.com/v2/versions?ids=%5B%22abc123%22%2C%22def456%22%5D"
+        );
+    }
+
+    #[test]
+    fn version_ids_are_normalized_without_changing_their_case() {
+        let normalized = normalize_version_ids(&[
+            "  AbC123 ".to_string(),
+            "abc123".to_string(),
+            String::new(),
+            "   ".to_string(),
+            "AbC123".to_string(),
+        ]);
+
+        assert_eq!(normalized, vec!["AbC123".to_string(), "abc123".to_string()]);
     }
 
     #[test]

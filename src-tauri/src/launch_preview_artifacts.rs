@@ -12,8 +12,8 @@ use crate::mod_cache::ModCacheRecord;
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{
-    version_rules_conflict, FailureReason, ModLoader, ResolutionResult, ResolutionTarget,
-    RuleOutcome,
+    resolve_modlist, version_rules_conflict, FailureReason, ModLoader, ResolutionResult,
+    ResolutionTarget, RuleOutcome,
 };
 use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
 
@@ -593,6 +593,116 @@ pub(super) async fn resolve_selected_remote_artifacts(
     }
 
     Ok(artifacts)
+}
+
+/// What a target actually loads, once the availability pass has had its say.
+#[derive(Debug, Clone)]
+pub(super) struct TargetSelection {
+    pub(super) resolution: ResolutionResult,
+    pub(super) selected_mods: Vec<SelectedMod>,
+}
+
+/// The Modrinth mods resolution selected and for which no artifact is
+/// available. `is_available` is the only difference between the online and the
+/// cache-only reading of "available", so the rest is shared.
+pub(super) fn unavailable_selected_mods<Available>(
+    selected_mods: &[SelectedMod],
+    is_available: Available,
+) -> Vec<String>
+where
+    Available: Fn(&str) -> bool,
+{
+    selected_mods
+        .iter()
+        .filter(|selected| matches!(selected.source, ModSource::Modrinth))
+        .filter(|selected| !is_available(&selected.mod_id))
+        .map(|selected| selected.mod_id.clone())
+        .collect()
+}
+
+/// Temporarily disable the mods with no available artifact and re-resolve, so
+/// alternatives get a chance. Nothing unavailable means the first resolution
+/// stands and no second resolution happens — the normal case.
+pub(super) fn reresolve_without_unavailable(
+    modlist: &ModList,
+    resolution: ResolutionResult,
+    unavailable: &[String],
+    target: &ResolutionTarget,
+) -> Result<ResolutionResult> {
+    if unavailable.is_empty() {
+        return Ok(resolution);
+    }
+
+    let mut patched = modlist.clone();
+    for mod_id in unavailable {
+        if let Some(rule) = patched.find_rule_mut(mod_id) {
+            rule.enabled = false;
+        }
+    }
+
+    resolve_modlist(&patched, target)
+}
+
+/// Resolve, drop what Modrinth has no compatible version for, re-resolve, and
+/// collect what the target loads.
+///
+/// Shared between `run_launch_pipeline` and the update pre-check on purpose:
+/// the pre-check exists to show exactly what the launch will install, and two
+/// copies of "which mods does this target load" are the easiest thing in this
+/// feature to let drift apart. The version map of this pass is thrown away here
+/// as it always was — only `unavailable` is used — because the authoritative
+/// set is the one after the re-resolution.
+pub(super) async fn resolve_online_selection(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    modlist: &ModList,
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+) -> Result<TargetSelection> {
+    let resolution = resolve_modlist(modlist, target)?;
+    let selected = collect_selected_mods(modlist, &resolution, target);
+    let versions = resolve_compatible_versions_hybrid(
+        app_handle,
+        launcher_paths,
+        http_client,
+        &selected,
+        client,
+        target,
+    )
+    .await?;
+    let unavailable =
+        unavailable_selected_mods(&selected, |mod_id| versions.contains_key(mod_id));
+    let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
+    let selected_mods = collect_selected_mods(modlist, &resolution, target);
+
+    Ok(TargetSelection {
+        resolution,
+        selected_mods,
+    })
+}
+
+/// Same as `resolve_online_selection`, with a valid cached artifact counting as
+/// available and no network at all.
+pub(super) async fn resolve_cache_only_selection(
+    launcher_paths: &LauncherPaths,
+    modlist: &ModList,
+    target: &ResolutionTarget,
+) -> Result<TargetSelection> {
+    let resolution = resolve_modlist(modlist, target)?;
+    let selected = collect_selected_mods(modlist, &resolution, target);
+    let available_artifacts =
+        resolve_selected_remote_artifacts(launcher_paths, &selected, target).await?;
+    let unavailable = unavailable_selected_mods(&selected, |mod_id| {
+        available_artifacts.contains_key(mod_id)
+    });
+    let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
+    let selected_mods = collect_selected_mods(modlist, &resolution, target);
+
+    Ok(TargetSelection {
+        resolution,
+        selected_mods,
+    })
 }
 
 pub(super) fn alt_viable_for_launch(

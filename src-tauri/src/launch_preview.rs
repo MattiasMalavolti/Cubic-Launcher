@@ -19,7 +19,7 @@ use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
 use crate::mod_cache::cached_artifact_path_for_pending_download;
 use crate::modrinth::ModrinthClient;
 use crate::process_streaming::ProcessLogStream;
-use crate::resolver::{resolve_modlist, ModLoader, ResolutionTarget};
+use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 
 use std::sync::Mutex;
@@ -43,6 +43,11 @@ use artifacts::*;
 #[path = "launch_preview_cache.rs"]
 mod cache;
 use cache::*;
+
+#[path = "launch_preview_precheck.rs"]
+mod precheck;
+use precheck::*;
+pub use precheck::{ModUpdateRow, UpdatePrecheckRequest, UpdatePrecheckResult};
 
 
 #[path = "launch_preview_models.rs"]
@@ -104,6 +109,22 @@ pub async fn verify_launch_command(
     run_launch_verification(app_handle, launcher_paths.inner().clone(), request)
         .await
         .map_err(|error| error.to_string())
+}
+
+/// The pre-check the frontend calls before a launch: what would be updated,
+/// and the versions the launch must then use. Writes nothing and launches
+/// nothing.
+#[tauri::command]
+pub async fn update_precheck_command(
+    app_handle: tauri::AppHandle,
+    launcher_paths: State<'_, LauncherPaths>,
+    request: UpdatePrecheckRequest,
+) -> Result<UpdatePrecheckResult, String> {
+    let launcher_paths = launcher_paths.inner().clone();
+
+    run_update_precheck(&app_handle, &launcher_paths, request)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// Kills the currently running Minecraft process, if any.
@@ -245,67 +266,31 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
 
     let modlist = load_modlist(&launcher_paths, &modlist_name)?;
     let modrinth_client = ModrinthClient::new();
-    let resolution = resolve_modlist(&modlist, &target)?;
 
     // Verify Modrinth availability for resolved mods. If a resolved mod has no
     // compatible version on Modrinth, temporarily disable it and re-resolve so
     // alternatives get a chance. In cache-only mode, a valid cached artifact
     // also counts as available.
-    let resolution = if effective_settings.cache_only_mode {
-        let selected = collect_selected_mods(&modlist, &resolution, &target);
-        let available_artifacts =
-            resolve_selected_remote_artifacts(&launcher_paths, &selected, &target).await?;
-        let unavailable = selected
-            .iter()
-            .filter(|selected| matches!(selected.source, ModSource::Modrinth))
-            .filter(|selected| !available_artifacts.contains_key(&selected.mod_id))
-            .map(|selected| selected.mod_id.clone())
-            .collect::<Vec<_>>();
-
-        if unavailable.is_empty() {
-            resolution
-        } else {
-            let mut patched = modlist.clone();
-            for uid in &unavailable {
-                if let Some(rule) = patched.find_rule_mut(uid) {
-                    rule.enabled = false;
-                }
-            }
-            resolve_modlist(&patched, &target)?
-        }
+    //
+    // Both branches live in `launch_preview_artifacts.rs` because the update
+    // pre-check runs the online one too: it has to name exactly the mods this
+    // launch will install.
+    let selection = if effective_settings.cache_only_mode {
+        resolve_cache_only_selection(&launcher_paths, &modlist, &target).await?
     } else {
-        let selected = collect_selected_mods(&modlist, &resolution, &target);
-        let versions = resolve_compatible_versions_hybrid(
+        resolve_online_selection(
             &app_handle,
             &launcher_paths,
             &http_client,
-            &selected,
+            &modlist,
             &modrinth_client,
             &target,
         )
-        .await?;
-        let unavailable = selected
-            .iter()
-            .filter(|selected| matches!(selected.source, ModSource::Modrinth))
-            .filter(|selected| !versions.contains_key(&selected.mod_id))
-            .map(|selected| selected.mod_id.clone())
-            .collect::<Vec<_>>();
-
-        if unavailable.is_empty() {
-            resolution
-        } else {
-            let mut patched = modlist.clone();
-            for uid in &unavailable {
-                if let Some(rule) = patched.find_rule_mut(uid) {
-                    rule.enabled = false;
-                }
-            }
-            resolve_modlist(&patched, &target)?
-        }
+        .await?
     };
-    log_resolution(&app_handle, &resolution)?;
+    log_resolution(&app_handle, &selection.resolution)?;
 
-    let selected_mods = collect_selected_mods(&modlist, &resolution, &target);
+    let selected_mods = selection.selected_mods;
     launch_log_session.write_selected_mods(&selected_mods)?;
     if selected_mods.len() > 300 {
         let detail = if effective_settings.cache_only_mode {
@@ -365,14 +350,14 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             Vec::new(),
         )
     } else {
-        // DESIGN: deliberately a second hybrid pass, not a reuse of the first.
-        // The first ran on `selected` (:277), derived from the first
-        // resolution; this one runs on `selected_mods` (:308), which exists
-        // only after the re-resolution at :303 and can contain alternatives
-        // the first pass never saw. Merging the two means handling that delta,
-        // and getting it wrong means a mod the re-resolution enabled that
-        // nobody looks up. Two hybrid passes still cost ~10 requests against
-        // the 52 of one request per mod per pass.
+        // DESIGN: deliberately a second hybrid pass, not a reuse of the one
+        // inside `resolve_online_selection`. That one ran on the mods the
+        // first resolution selected; this one runs on `selected_mods`, which
+        // exists only after the re-resolution and can contain alternatives the
+        // first pass never saw. Merging the two means handling that delta, and
+        // getting it wrong means a mod the re-resolution enabled that nobody
+        // looks up. Two hybrid passes still cost ~10 requests against the 52
+        // of one request per mod per pass.
         let compatible_versions = resolve_compatible_versions_hybrid(
             &app_handle,
             &launcher_paths,

@@ -98,22 +98,23 @@ pub(super) fn load_cached_mod_record_by_version(
     repository.find_by_version_id(version_id, target)
 }
 
-/// Cached sha1 per selected Modrinth mod, on this target, keyed by the mod id
-/// used in the rules.
+/// One cache column per selected Modrinth mod, on this target, keyed by the mod
+/// id used in the rules.
 ///
 /// One connection for the whole pass, unlike `load_cached_mod_record_for_target`
-/// which opens one per mod. The hash comes from the row itself: see
-/// `find_cached_file_hash_by_project` for why the disk-checking lookup is the
-/// wrong tool here. Mods with no row, or a row whose `file_hash` is NULL, are
-/// simply absent from the map.
-pub(super) fn load_cached_file_hashes_for_selected(
+/// which opens one per mod. Mods with no row — or a row whose column is unusable
+/// — are simply absent from the map.
+fn load_cached_column_for_selected<Lookup>(
     launcher_paths: &LauncherPaths,
     selected_mods: &[SelectedMod],
-    target: &ResolutionTarget,
-) -> Result<HashMap<String, String>> {
-    let mut hashes = HashMap::new();
+    lookup: Lookup,
+) -> Result<HashMap<String, String>>
+where
+    Lookup: Fn(&SqliteModCacheRepository<'_>, &str) -> Result<Option<String>>,
+{
+    let mut values = HashMap::new();
     if selected_mods.is_empty() {
-        return Ok(hashes);
+        return Ok(values);
     }
 
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
@@ -125,18 +126,42 @@ pub(super) fn load_cached_file_hashes_for_selected(
     let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
 
     for selected in selected_mods {
-        if !matches!(selected.source, ModSource::Modrinth) || hashes.contains_key(&selected.mod_id)
+        if !matches!(selected.source, ModSource::Modrinth) || values.contains_key(&selected.mod_id)
         {
             continue;
         }
-        if let Some(hash) =
-            repository.find_cached_file_hash_by_project_or_alias(&selected.mod_id, target)?
-        {
-            hashes.insert(selected.mod_id.clone(), hash);
+        if let Some(value) = lookup(&repository, &selected.mod_id)? {
+            values.insert(selected.mod_id.clone(), value);
         }
     }
 
-    Ok(hashes)
+    Ok(values)
+}
+
+/// Cached sha1 per selected Modrinth mod. The hash comes from the row itself:
+/// see `find_cached_file_hash_by_project` for why the disk-checking lookup is
+/// the wrong tool here.
+pub(super) fn load_cached_file_hashes_for_selected(
+    launcher_paths: &LauncherPaths,
+    selected_mods: &[SelectedMod],
+    target: &ResolutionTarget,
+) -> Result<HashMap<String, String>> {
+    load_cached_column_for_selected(launcher_paths, selected_mods, |repository, mod_id| {
+        repository.find_cached_file_hash_by_project_or_alias(mod_id, target)
+    })
+}
+
+/// Registered `modrinth_version_id` per selected Modrinth mod — the "current"
+/// side of an update row. Absent means "never downloaded for this target",
+/// which by D17 is not an update.
+pub(super) fn load_cached_version_ids_for_selected(
+    launcher_paths: &LauncherPaths,
+    selected_mods: &[SelectedMod],
+    target: &ResolutionTarget,
+) -> Result<HashMap<String, String>> {
+    load_cached_column_for_selected(launcher_paths, selected_mods, |repository, mod_id| {
+        repository.find_cached_version_id_by_project_or_alias(mod_id, target)
+    })
 }
 
 pub(super) fn load_cached_dependency_requests(

@@ -351,6 +351,75 @@ impl<'connection> SqliteModCacheRepository<'connection> {
 
         self.find_cached_file_hash_by_project(&canonical_project_id, target)
     }
+
+    /// The `modrinth_version_id` registered for a project on this target,
+    /// **without** requiring the jar to be on disk.
+    ///
+    /// Same row, same `rowid DESC`, and the same reason as
+    /// `find_cached_file_hash_by_project`: the pre-check has to report which
+    /// version is *registered* — that is what "0.5.8 → 0.6.0" means — and not
+    /// whether its file survived. Picking the same row as the hash lookup also
+    /// keeps the "current" version and the version the candidate was derived
+    /// from describing one file.
+    ///
+    /// `is_local = 1` rows are excluded: a locally copied jar carries a
+    /// synthetic version id, and `GET /versions?ids=` rejects the whole request
+    /// on one non-base62 id.
+    pub fn find_cached_version_id_by_project(
+        &self,
+        project_id: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<String>> {
+        let version_id = self
+            .connection
+            .query_row(
+                r#"
+                SELECT modrinth_version_id
+                FROM mod_cache
+                WHERE modrinth_project_id = ?1
+                  AND mc_version = ?2
+                  AND mod_loader = ?3
+                  AND is_local = 0
+                  AND modrinth_version_id IS NOT NULL
+                  AND trim(modrinth_version_id) <> ''
+                ORDER BY rowid DESC
+                LIMIT 1
+                "#,
+                params![
+                    project_id.trim(),
+                    &target.minecraft_version,
+                    target.mod_loader.as_modrinth_loader(),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        Ok(version_id.map(|version_id| version_id.trim().to_string()))
+    }
+
+    /// Same slug → canonical id bridge as
+    /// `find_cached_file_hash_by_project_or_alias`.
+    pub fn find_cached_version_id_by_project_or_alias(
+        &self,
+        project_id_or_alias: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<String>> {
+        if let Some(version_id) = self.find_cached_version_id_by_project(project_id_or_alias, target)?
+        {
+            return Ok(Some(version_id));
+        }
+
+        let Some(canonical_project_id) = self.find_canonical_project_id(project_id_or_alias)?
+        else {
+            return Ok(None);
+        };
+
+        if canonical_project_id == project_id_or_alias.trim() {
+            return Ok(None);
+        }
+
+        self.find_cached_version_id_by_project(&canonical_project_id, target)
+    }
 }
 
 impl ModCacheLookup for SqliteModCacheRepository<'_> {
@@ -917,6 +986,84 @@ mod tests {
                 .as_deref(),
             Some("abcdef0123456789abcdef0123456789abcdef01")
         );
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn version_id_lookup_answers_for_an_intact_row_whose_jar_is_gone() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        repository
+            .upsert_modrinth_version(
+                &version("canonical-sodium", "version-1", "sodium.jar"),
+                &target(),
+            )
+            .expect("cache record should insert");
+        repository
+            .upsert_project_alias("sodium", "canonical-sodium")
+            .expect("project alias should insert");
+
+        // No jar on disk. The pre-check has to say which version is registered,
+        // and a missing file does not change that answer.
+        assert!(repository
+            .find_compatible_by_project_or_alias("sodium", &target())
+            .expect("record lookup should succeed")
+            .is_none());
+        assert_eq!(
+            repository
+                .find_cached_version_id_by_project("canonical-sodium", &target())
+                .expect("version id lookup should succeed")
+                .as_deref(),
+            Some("version-1")
+        );
+        assert_eq!(
+            repository
+                .find_cached_version_id_by_project_or_alias("sodium", &target())
+                .expect("alias version id lookup should succeed")
+                .as_deref(),
+            Some("version-1")
+        );
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn version_id_lookup_ignores_a_local_row() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        repository
+            .upsert_modrinth_version(&version("sodium", "local-sodium-1", "sodium.jar"), &target())
+            .expect("cache record should insert");
+        connection
+            .execute(
+                "UPDATE mod_cache SET is_local = 1 WHERE modrinth_version_id = ?1",
+                ["local-sodium-1"],
+            )
+            .expect("row should become local");
+
+        // A locally copied jar carries a synthetic version id, and
+        // `GET /versions?ids=` rejects the whole request on one non-base62 id.
+        assert!(repository
+            .find_cached_version_id_by_project("sodium", &target())
+            .expect("version id lookup should succeed")
+            .is_none());
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
