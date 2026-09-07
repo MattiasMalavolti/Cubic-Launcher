@@ -275,7 +275,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         }
     } else {
         let selected = collect_selected_mods(&modlist, &resolution, &target);
-        let versions = prefetch_compatible_versions_for_selected(
+        let versions = resolve_compatible_versions_hybrid(
             &app_handle,
             &launcher_paths,
             &http_client,
@@ -365,7 +365,15 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             Vec::new(),
         )
     } else {
-        let compatible_versions = prefetch_compatible_versions_for_selected(
+        // DESIGN: deliberately a second hybrid pass, not a reuse of the first.
+        // The first ran on `selected` (:277), derived from the first
+        // resolution; this one runs on `selected_mods` (:308), which exists
+        // only after the re-resolution at :303 and can contain alternatives
+        // the first pass never saw. Merging the two means handling that delta,
+        // and getting it wrong means a mod the re-resolution enabled that
+        // nobody looks up. Two hybrid passes still cost ~10 requests against
+        // the 52 of one request per mod per pass.
+        let compatible_versions = resolve_compatible_versions_hybrid(
             &app_handle,
             &launcher_paths,
             &http_client,
