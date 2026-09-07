@@ -160,6 +160,9 @@ pub(super) struct CachedHashSplit {
 pub(super) struct HashStageOutcome {
     pub(super) resolved: HashMap<String, ModrinthVersion>,
     pub(super) per_project_mod_ids: Vec<String>,
+    /// Mod ids that had a cached hash the bulk response omitted, and are
+    /// therefore retried per project (D22). Subset of `per_project_mod_ids`.
+    pub(super) omitted_mod_ids: Vec<String>,
     /// Set when the bulk call itself failed and its whole set fell back.
     pub(super) bulk_error: Option<String>,
 }
@@ -190,9 +193,10 @@ pub(super) fn split_selected_by_cached_hash(
 
 /// Re-key a hash-keyed bulk response by mod id.
 ///
-/// A hash the response omitted yields no entry, so the mod lands in the
-/// caller's `unavailable` set — the same place a per-project lookup with no
-/// compatible version puts it. Two mod ids sharing one hash both resolve.
+/// A hash the response omitted yields no entry; the caller retries that mod per
+/// project instead of declaring it unavailable, because the response cannot
+/// distinguish "no version for this target" from "this hash is no longer
+/// known". Two mod ids sharing one hash both resolve.
 pub(super) fn versions_by_mod_id(
     hashed: &[(String, String)],
     versions_by_hash: &HashMap<String, ModrinthVersion>,
@@ -222,11 +226,17 @@ pub(super) fn merge_resolved_versions(
 
 /// The bulk stage: one cascade for every mod that has a cached hash.
 ///
-/// Generic over the request so the fallback is testable without network. A
-/// per-project error costs one mod today
-/// (`prefetch_compatible_versions_for_selected`); a bulk error would cost the
-/// whole modlist, so a failed call sends its set to the per-project path
-/// instead of shrinking the launch. That path is slow, but it is an error path.
+/// Generic over the request so both fallbacks are testable without network.
+///
+/// Two things go back to the per-project path. An **omitted hash** (D22): the
+/// endpoint answers `200` with the hash simply absent, and that covers both "no
+/// version exists for this target" — where the per-project path finds nothing
+/// either, so the retry costs one wasted request — and "Modrinth no longer
+/// knows this hash", where the per-project path still finds the version and the
+/// mod keeps working exactly as it does today. A **failed call**: a per-project
+/// error costs one mod today (`prefetch_compatible_versions_for_selected`),
+/// while a bulk error would cost the whole modlist, so the set falls back
+/// instead of shrinking the launch. Both are slow paths, and both are rare.
 pub(super) async fn resolve_versions_for_cached_hashes<Fetch, Fut>(
     split: &CachedHashSplit,
     fetch_bulk: Fetch,
@@ -239,6 +249,7 @@ where
         return HashStageOutcome {
             resolved: HashMap::new(),
             per_project_mod_ids: split.unhashed.clone(),
+            omitted_mod_ids: Vec::new(),
             bulk_error: None,
         };
     }
@@ -250,11 +261,26 @@ where
         .collect::<Vec<_>>();
 
     match fetch_bulk(hashes).await {
-        Ok(versions_by_hash) => HashStageOutcome {
-            resolved: versions_by_mod_id(&split.hashed, &versions_by_hash),
-            per_project_mod_ids: split.unhashed.clone(),
-            bulk_error: None,
-        },
+        Ok(versions_by_hash) => {
+            let resolved = versions_by_mod_id(&split.hashed, &versions_by_hash);
+            let omitted_mod_ids = split
+                .hashed
+                .iter()
+                .map(|(mod_id, _)| mod_id)
+                .filter(|mod_id| !resolved.contains_key(mod_id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let mut per_project_mod_ids = omitted_mod_ids.clone();
+            per_project_mod_ids.extend(split.unhashed.iter().cloned());
+
+            HashStageOutcome {
+                resolved,
+                per_project_mod_ids,
+                omitted_mod_ids,
+                bulk_error: None,
+            }
+        }
         Err(error) => {
             let mut per_project_mod_ids = split
                 .hashed
@@ -266,6 +292,7 @@ where
             HashStageOutcome {
                 resolved: HashMap::new(),
                 per_project_mod_ids,
+                omitted_mod_ids: Vec::new(),
                 bulk_error: Some(format!("{error:#}")),
             }
         }
@@ -301,26 +328,18 @@ pub(super) async fn resolve_compatible_versions_hybrid(
                 split.hashed.len()
             ),
         );
-    } else {
+    } else if !outcome.omitted_mod_ids.is_empty() {
         // The endpoint reports neither "unknown hash" nor "no version for this
-        // target": both are omissions. Naming the omitted mods is the only
-        // diagnostic available before they are disabled and re-resolved.
-        let omitted = split
-            .hashed
-            .iter()
-            .map(|(mod_id, _)| mod_id.as_str())
-            .filter(|mod_id| !outcome.resolved.contains_key(*mod_id))
-            .collect::<Vec<_>>();
-        if !omitted.is_empty() {
-            let _ = emit_log(
-                app_handle,
-                ProcessLogStream::Stderr,
-                format!(
-                    "[Launch] bulk version lookup returned no version for {}",
-                    omitted.join(", ")
-                ),
-            );
-        }
+        // target": both are omissions. Naming them is the only diagnostic
+        // available for a case that should not happen (D23).
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Launch] bulk version lookup omitted {}; retrying one request per mod",
+                outcome.omitted_mod_ids.join(", ")
+            ),
+        );
     }
 
     let per_project_mod_ids = outcome
@@ -796,8 +815,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hash_omitted_by_the_bulk_response_leaves_its_mod_unresolved() {
-        let selected = vec![modrinth_mod("sodium"), modrinth_mod("lithium")];
+    async fn a_hash_omitted_by_the_bulk_response_is_retried_per_project() {
+        let selected = vec![
+            modrinth_mod("sodium"),
+            modrinth_mod("lithium"),
+            modrinth_mod("polytone"),
+        ];
         let split = split_selected_by_cached_hash(
             &selected,
             &cached_hashes(&[("sodium", "aaa1"), ("lithium", "bbb2")]),
@@ -813,11 +836,23 @@ mod tests {
 
         assert_eq!(outcome.resolved.len(), 1);
         assert!(outcome.resolved.contains_key("sodium"));
-        // The omitted mod must reach the caller's `unavailable` set, not a
-        // second per-project request and not silence.
-        assert!(!outcome.resolved.contains_key("lithium"));
-        assert!(outcome.per_project_mod_ids.is_empty());
+        // An omission cannot be told apart from "no version for this target",
+        // so the mod goes back on the per-project path instead of being
+        // declared unavailable — ahead of the mods that never had a hash.
+        assert_eq!(outcome.omitted_mod_ids, vec!["lithium"]);
+        assert_eq!(outcome.per_project_mod_ids, vec!["lithium", "polytone"]);
         assert!(outcome.bulk_error.is_none());
+
+        // ...and it resolves when the per-project stage finds the version, the
+        // case where an unknown hash would otherwise silently drop a mod that
+        // works today.
+        let from_per_project = test_version("lithium-version", "2026-01-01T00:00:00Z");
+        let merged = merge_resolved_versions(
+            outcome.resolved,
+            HashMap::from([("lithium".to_string(), from_per_project.clone())]),
+        );
+        assert_eq!(merged.get("lithium"), Some(&from_per_project));
+        assert_eq!(merged.len(), 2);
     }
 
     #[tokio::test]
