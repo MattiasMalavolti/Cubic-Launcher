@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::launcher_paths::LauncherPaths;
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
+use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 
 use super::{
-    load_cached_version_ids_for_selected, load_modlist, parse_mod_loader,
+    emit_log, load_cached_version_ids_for_selected, load_modlist, parse_mod_loader,
     resolve_compatible_versions_hybrid, resolve_online_selection, SelectedMod,
 };
 
@@ -46,9 +47,11 @@ pub struct ModUpdateRow {
     /// already resolves icon and name from it through `fetchModMetadata`.
     pub project_id: String,
     pub current_version_id: String,
-    /// `None` when `GET /versions?ids=` did not return the registered version,
-    /// which means Modrinth no longer has it. The row is still an update: the
-    /// two ids differ, and that is true whatever the label ends up saying.
+    /// `None` when `GET /versions?ids=` did not return the registered version
+    /// — Modrinth no longer has it — or when that lookup failed altogether,
+    /// which `version_number_lookup_error` distinguishes. The row is still an
+    /// update either way: the two ids differ, and that is true whatever the
+    /// label ends up saying.
     pub current_version_number: Option<String>,
     pub candidate_version_id: String,
     pub candidate_version_number: String,
@@ -68,6 +71,15 @@ pub struct UpdatePrecheckResult {
     /// that was never downloaded is in here even though it is not an update
     /// (D17).
     pub resolved: HashMap<String, String>,
+    /// Set when `GET /versions?ids=` failed, which costs the "from" labels and
+    /// nothing else.
+    ///
+    /// The version numbers are a **separate failure domain** on purpose:
+    /// `resolved` is what the launch needs (D16) and `mod_cache` alone answers
+    /// which version is registered, so losing a cosmetic label must not abort
+    /// the pre-check. One malformed version id would otherwise `400` the whole
+    /// request and take the launch's version map down with it.
+    pub version_number_lookup_error: Option<String>,
 }
 
 /// A vanilla target loads no mods: an empty payload, not an error, and no
@@ -103,6 +115,35 @@ pub(super) fn version_ids_needing_a_number(
     ids
 }
 
+/// The display side of the payload: the version numbers that were resolved,
+/// and the reason there are none if the lookup failed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct VersionNumbers {
+    pub(super) by_version_id: HashMap<String, String>,
+    pub(super) lookup_error: Option<String>,
+}
+
+impl VersionNumbers {
+    /// A failed lookup degrades to "no labels", never to "no updates": the
+    /// version map the launch needs comes from `mod_cache` and the candidate
+    /// lookups, both of which have already answered by the time this runs.
+    pub(super) fn from_lookup(lookup: Result<HashMap<String, ModrinthVersion>>) -> Self {
+        match lookup {
+            Ok(versions) => Self {
+                by_version_id: versions
+                    .into_iter()
+                    .map(|(version_id, version)| (version_id, version.version_number))
+                    .collect(),
+                lookup_error: None,
+            },
+            Err(error) => Self {
+                by_version_id: HashMap::new(),
+                lookup_error: Some(format!("{error:#}")),
+            },
+        }
+    }
+}
+
 /// Build the payload from the maps that were already collected.
 ///
 /// Pure on purpose: D9, D16 and D17 all live here, and this is what the tests
@@ -111,9 +152,12 @@ pub(super) fn build_precheck_result(
     selected_mods: &[SelectedMod],
     candidates: &HashMap<String, ModrinthVersion>,
     cached_version_ids: &HashMap<String, String>,
-    cached_version_numbers: &HashMap<String, String>,
+    cached_version_numbers: &VersionNumbers,
 ) -> UpdatePrecheckResult {
-    let mut result = UpdatePrecheckResult::default();
+    let mut result = UpdatePrecheckResult {
+        version_number_lookup_error: cached_version_numbers.lookup_error.clone(),
+        ..UpdatePrecheckResult::default()
+    };
     let mut seen = HashSet::new();
 
     for selected in selected_mods {
@@ -148,7 +192,10 @@ pub(super) fn build_precheck_result(
             mod_id: selected.mod_id.clone(),
             project_id: candidate.project_id.clone(),
             current_version_id: current_version_id.clone(),
-            current_version_number: cached_version_numbers.get(current_version_id).cloned(),
+            current_version_number: cached_version_numbers
+                .by_version_id
+                .get(current_version_id)
+                .cloned(),
             candidate_version_id: candidate.id.clone(),
             candidate_version_number: candidate.version_number.clone(),
         });
@@ -209,16 +256,23 @@ pub(super) async fn run_update_precheck(
     let cached_version_ids =
         load_cached_version_ids_for_selected(launcher_paths, &selection.selected_mods, &target)?;
     let wanted_numbers = version_ids_needing_a_number(&cached_version_ids, &candidates);
-    // Propagated rather than swallowed: the candidate lookups already succeeded
-    // by this point, so a failure here is a real failure and not "no updates".
-    // A caller that cannot show the popup falls back to launching from the
-    // cached versions (D19).
-    let cached_version_numbers = modrinth_client
-        .fetch_versions_by_ids(&wanted_numbers)
-        .await?
-        .into_iter()
-        .map(|(version_id, version)| (version_id, version.version_number))
-        .collect::<HashMap<_, _>>();
+    // Degraded, not propagated: `resolved` is the part the launch cannot do
+    // without (D16), and it is already complete here. One malformed version id
+    // `400`s this whole request, so letting it fail the command would lose the
+    // version map for a label.
+    let cached_version_numbers = VersionNumbers::from_lookup(
+        modrinth_client.fetch_versions_by_ids(&wanted_numbers).await,
+    );
+    if let Some(error) = &cached_version_numbers.lookup_error {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Precheck] version metadata lookup failed for {} cached versions; rows keep their ids and lose the current version number ({error})",
+                wanted_numbers.len()
+            ),
+        );
+    }
 
     Ok(build_precheck_result(
         &selection.selected_mods,
@@ -276,6 +330,13 @@ mod tests {
             .collect()
     }
 
+    fn numbers(entries: &[(&str, &str)]) -> VersionNumbers {
+        VersionNumbers {
+            by_version_id: string_map(entries),
+            lookup_error: None,
+        }
+    }
+
     fn string_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
         entries
             .iter()
@@ -302,7 +363,7 @@ mod tests {
         ]);
         let cached = string_map(&[("sodium", "sodium-v2"), ("lithium", "lithium-v7")]);
 
-        let result = build_precheck_result(&selected, &candidates, &cached, &HashMap::new());
+        let result = build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
 
         assert!(result.updates.is_empty());
         assert_eq!(
@@ -322,7 +383,7 @@ mod tests {
             ("lithium", "lithium-v7", "0.11.2"),
         ]);
         let cached = string_map(&[("sodium", "sodium-v1"), ("lithium", "lithium-v6")]);
-        let numbers = string_map(&[("sodium-v1", "0.5.8"), ("lithium-v6", "0.11.1")]);
+        let numbers = numbers(&[("sodium-v1", "0.5.8"), ("lithium-v6", "0.11.1")]);
 
         let result = build_precheck_result(&selected, &candidates, &cached, &numbers);
 
@@ -349,7 +410,7 @@ mod tests {
         let selected = vec![modrinth_mod("sodium")];
         let candidates = candidates(&[("sodium", "sodium-v2", "0.6.0")]);
         let cached = string_map(&[("sodium", "sodium-v1")]);
-        let numbers = string_map(&[("sodium-v1", "0.5.8")]);
+        let numbers = numbers(&[("sodium-v1", "0.5.8")]);
 
         let result = build_precheck_result(&selected, &candidates, &cached, &numbers);
 
@@ -383,7 +444,7 @@ mod tests {
             ("lithium", "lithium-v7"),
             ("iris", "iris-v2"),
         ]);
-        let numbers = string_map(&[("sodium-v1", "0.5.8"), ("iris-v2", "1.7.0")]);
+        let numbers = numbers(&[("sodium-v1", "0.5.8"), ("iris-v2", "1.7.0")]);
 
         let result = build_precheck_result(&selected, &candidates, &cached, &numbers);
 
@@ -407,7 +468,7 @@ mod tests {
         ]);
         let cached = string_map(&[("sodium", "sodium-v2")]);
 
-        let result = build_precheck_result(&selected, &candidates, &cached, &HashMap::new());
+        let result = build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
 
         assert!(result.updates.is_empty());
         assert_eq!(
@@ -421,7 +482,7 @@ mod tests {
         let selected = vec![modrinth_mod("sodium"), modrinth_mod("epic-fight")];
         let candidates = candidates(&[("sodium", "sodium-v2", "0.6.0")]);
         let cached = string_map(&[("sodium", "sodium-v1"), ("epic-fight", "epic-fight-v1")]);
-        let numbers = string_map(&[("sodium-v1", "0.5.8")]);
+        let numbers = numbers(&[("sodium-v1", "0.5.8")]);
 
         let result = build_precheck_result(&selected, &candidates, &cached, &numbers);
 
@@ -436,7 +497,7 @@ mod tests {
         let candidates = candidates(&[("sodium", "sodium-v2", "0.6.0")]);
         let cached = string_map(&[("sodium", "sodium-v1")]);
 
-        let result = build_precheck_result(&selected, &candidates, &cached, &HashMap::new());
+        let result = build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
 
         assert_eq!(result.updates.len(), 1);
         assert_eq!(result.updates[0].current_version_id, "sodium-v1");
@@ -452,7 +513,7 @@ mod tests {
         let candidates = candidates(&[("optifine", "optifine-v2", "1.0.1")]);
         let cached = string_map(&[("optifine", "optifine-v1")]);
 
-        let result = build_precheck_result(&selected, &candidates, &cached, &HashMap::new());
+        let result = build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
 
         assert!(result.updates.is_empty());
         assert!(result.resolved.is_empty());
@@ -498,7 +559,7 @@ mod tests {
             &selected,
             &candidates(&[("sodium", "sodium-v2", "0.6.0")]),
             &string_map(&[("sodium", "sodium-v1"), ("embeddium", "embeddium-v1")]),
-            &string_map(&[("sodium-v1", "0.5.8")]),
+            &numbers(&[("sodium-v1", "0.5.8")]),
         );
 
         assert_eq!(
@@ -514,16 +575,46 @@ mod tests {
 
     #[test]
     fn a_vanilla_target_has_nothing_to_check() {
+        // The command path parses the loader string first, so the short-circuit
+        // is only reachable if "vanilla" parses instead of erroring.
         let vanilla = ResolutionTarget {
             minecraft_version: "1.21.1".into(),
-            mod_loader: ModLoader::Vanilla,
+            mod_loader: parse_mod_loader("vanilla").expect("vanilla must parse"),
         };
 
+        assert_eq!(vanilla.mod_loader, ModLoader::Vanilla);
         assert_eq!(
             empty_precheck_for_loaderless_target(&vanilla),
             Some(UpdatePrecheckResult::default())
         );
         assert_eq!(empty_precheck_for_loaderless_target(&target()), None);
+    }
+
+    #[test]
+    fn a_failed_number_lookup_keeps_every_row_and_names_itself() {
+        let selected = vec![modrinth_mod("sodium"), modrinth_mod("lithium")];
+        let candidates = candidates(&[
+            ("sodium", "sodium-v2", "0.6.0"),
+            ("lithium", "lithium-v7", "0.11.2"),
+        ]);
+        let cached = string_map(&[("sodium", "sodium-v1"), ("lithium", "lithium-v6")]);
+        let failed = VersionNumbers::from_lookup(Err(anyhow::anyhow!(
+            "Modrinth returned an error for a 2-version metadata lookup"
+        )));
+
+        let result = build_precheck_result(&selected, &candidates, &cached, &failed);
+
+        // The labels are gone, the updates and the launch's version map are not.
+        assert_eq!(result.updates.len(), 2);
+        assert!(result
+            .updates
+            .iter()
+            .all(|row| row.current_version_number.is_none()));
+        assert_eq!(result.resolved.len(), 2);
+        assert_eq!(
+            result.version_number_lookup_error.as_deref(),
+            Some("Modrinth returned an error for a 2-version metadata lookup")
+        );
     }
 
     #[test]

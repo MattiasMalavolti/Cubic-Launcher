@@ -355,12 +355,19 @@ impl<'connection> SqliteModCacheRepository<'connection> {
     /// The `modrinth_version_id` registered for a project on this target,
     /// **without** requiring the jar to be on disk.
     ///
-    /// Same row, same `rowid DESC`, and the same reason as
-    /// `find_cached_file_hash_by_project`: the pre-check has to report which
-    /// version is *registered* — that is what "0.5.8 → 0.6.0" means — and not
-    /// whether its file survived. Picking the same row as the hash lookup also
-    /// keeps the "current" version and the version the candidate was derived
-    /// from describing one file.
+    /// Same reason as `find_cached_file_hash_by_project`: the pre-check has to
+    /// report which version is *registered* — that is what "0.5.8 → 0.6.0"
+    /// means — and not whether its file survived.
+    ///
+    /// It also has to be **the same row** that lookup picks, or the reported
+    /// "current" version would not be the one whose hash produced the
+    /// candidate. The primary key is `(modrinth_version_id, mc_version,
+    /// mod_loader)`, so one project and target can own several rows; the hash
+    /// lookup takes the newest row *that has a usable hash*, which is why the
+    /// hash predicate is repeated here as the first ordering key instead of as
+    /// a filter. Whenever a hashed row exists both lookups land on it; with no
+    /// hashed row the version id is still reported, which is the honest answer
+    /// for a mod on the per-project path.
     ///
     /// `is_local = 1` rows are excluded: a locally copied jar carries a
     /// synthetic version id, and `GET /versions?ids=` rejects the whole request
@@ -382,7 +389,9 @@ impl<'connection> SqliteModCacheRepository<'connection> {
                   AND is_local = 0
                   AND modrinth_version_id IS NOT NULL
                   AND trim(modrinth_version_id) <> ''
-                ORDER BY rowid DESC
+                ORDER BY
+                    (file_hash IS NOT NULL AND trim(file_hash) <> '') DESC,
+                    rowid DESC
                 LIMIT 1
                 "#,
                 params![
@@ -1064,6 +1073,54 @@ mod tests {
             .find_cached_version_id_by_project("sodium", &target())
             .expect("version id lookup should succeed")
             .is_none());
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn version_id_lookup_prefers_the_same_row_as_the_hash_lookup() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        repository
+            .upsert_modrinth_version(&version("sodium", "hashed-row", "sodium-a.jar"), &target())
+            .expect("hashed row should insert");
+        // A newer row for the same project and target — the primary key is
+        // (version id, mc version, loader), so this is legal — whose hash is
+        // NULL. The hash lookup skips it; the version id lookup must skip it
+        // too, or the reported "current" version would not be the one the
+        // candidate hash came from.
+        repository
+            .upsert_modrinth_version(&version("sodium", "unhashed-row", "sodium-b.jar"), &target())
+            .expect("second row should insert");
+        connection
+            .execute(
+                "UPDATE mod_cache SET file_hash = NULL WHERE modrinth_version_id = ?1",
+                ["unhashed-row"],
+            )
+            .expect("file_hash should be nulled");
+
+        assert_eq!(
+            repository
+                .find_cached_file_hash_by_project("sodium", &target())
+                .expect("hash lookup should succeed")
+                .as_deref(),
+            Some("hashed-row-sha1")
+        );
+        assert_eq!(
+            repository
+                .find_cached_version_id_by_project("sodium", &target())
+                .expect("version id lookup should succeed")
+                .as_deref(),
+            Some("hashed-row")
+        );
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
