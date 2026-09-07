@@ -283,6 +283,74 @@ impl<'connection> SqliteModCacheRepository<'connection> {
 
         self.find_compatible_by_project(&canonical_project_id, target)
     }
+
+    /// The cached sha1 for a project on this target, **without** requiring the
+    /// jar to be on disk.
+    ///
+    /// `find_compatible_by_project` deliberately hides a row whose artifact is
+    /// gone (`ensure_record_file_available`), because its callers need a file to
+    /// link. A hash names a Modrinth *version*, not a local file, so "which
+    /// version is newest for the project this file came from" stays answerable
+    /// with an emptied cache directory. Reusing the disk-checking lookup here
+    /// would push every mod onto the per-project path exactly when the bulk
+    /// path matters most.
+    ///
+    /// The hash is lowercased here, once: `POST /v2/version_files/update` omits
+    /// an uppercase hash in silence, indistinguishably from an unknown one.
+    pub fn find_cached_file_hash_by_project(
+        &self,
+        project_id: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<String>> {
+        let hash = self
+            .connection
+            .query_row(
+                r#"
+                SELECT file_hash
+                FROM mod_cache
+                WHERE modrinth_project_id = ?1
+                  AND mc_version = ?2
+                  AND mod_loader = ?3
+                  AND is_local = 0
+                  AND file_hash IS NOT NULL
+                  AND trim(file_hash) <> ''
+                ORDER BY rowid DESC
+                LIMIT 1
+                "#,
+                params![
+                    project_id.trim(),
+                    &target.minecraft_version,
+                    target.mod_loader.as_modrinth_loader(),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        Ok(hash.map(|hash| hash.trim().to_ascii_lowercase()))
+    }
+
+    /// Same bridge as `find_compatible_by_project_or_alias`: user rules can name
+    /// a slug, `modrinth_project_aliases` maps it to the canonical project id.
+    pub fn find_cached_file_hash_by_project_or_alias(
+        &self,
+        project_id_or_alias: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<String>> {
+        if let Some(hash) = self.find_cached_file_hash_by_project(project_id_or_alias, target)? {
+            return Ok(Some(hash));
+        }
+
+        let Some(canonical_project_id) = self.find_canonical_project_id(project_id_or_alias)?
+        else {
+            return Ok(None);
+        };
+
+        if canonical_project_id == project_id_or_alias.trim() {
+            return Ok(None);
+        }
+
+        self.find_cached_file_hash_by_project(&canonical_project_id, target)
+    }
 }
 
 impl ModCacheLookup for SqliteModCacheRepository<'_> {
@@ -742,6 +810,113 @@ mod tests {
 
         assert_eq!(record.modrinth_project_id, "canonical-sodium");
         assert_eq!(record.modrinth_version_id, "version-1");
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn hash_lookup_answers_for_an_intact_row_whose_jar_is_gone() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        repository
+            .upsert_modrinth_version(&version("canonical-sodium", "version-1", "sodium.jar"), &target())
+            .expect("cache record should insert");
+        repository
+            .upsert_project_alias("sodium", "canonical-sodium")
+            .expect("project alias should insert");
+
+        // No jar is written: the record lookup must stay silent, the hash lookup
+        // must not. An emptied cache directory would otherwise send the whole
+        // modlist onto the per-request-per-mod path.
+        assert!(repository
+            .find_compatible_by_project_or_alias("sodium", &target())
+            .expect("record lookup should succeed")
+            .is_none());
+        assert_eq!(
+            repository
+                .find_cached_file_hash_by_project("canonical-sodium", &target())
+                .expect("hash lookup should succeed")
+                .as_deref(),
+            Some("version-1-sha1")
+        );
+        assert_eq!(
+            repository
+                .find_cached_file_hash_by_project_or_alias("sodium", &target())
+                .expect("alias hash lookup should succeed")
+                .as_deref(),
+            Some("version-1-sha1")
+        );
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn hash_lookup_skips_a_row_without_a_usable_file_hash() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        repository
+            .upsert_modrinth_version(&version("sodium", "version-1", "sodium.jar"), &target())
+            .expect("cache record should insert");
+        connection
+            .execute(
+                "UPDATE mod_cache SET file_hash = NULL WHERE modrinth_version_id = ?1",
+                ["version-1"],
+            )
+            .expect("file_hash should be nulled");
+
+        assert!(repository
+            .find_cached_file_hash_by_project("sodium", &target())
+            .expect("hash lookup should succeed")
+            .is_none());
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn hash_lookup_lowercases_the_stored_hash() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        repository
+            .upsert_modrinth_version(&version("sodium", "version-1", "sodium.jar"), &target())
+            .expect("cache record should insert");
+        connection
+            .execute(
+                "UPDATE mod_cache SET file_hash = ?1 WHERE modrinth_version_id = ?2",
+                ["  ABCDEF0123456789ABCDEF0123456789ABCDEF01  ", "version-1"],
+            )
+            .expect("file_hash should be replaced with an uppercase value");
+
+        assert_eq!(
+            repository
+                .find_cached_file_hash_by_project("sodium", &target())
+                .expect("hash lookup should succeed")
+                .as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");

@@ -8,7 +8,7 @@
 // parents so cache-only launches do not reuse stale dependencies from another
 // Minecraft version or loader.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -96,6 +96,47 @@ pub(super) fn load_cached_mod_record_by_version(
     })?;
     let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
     repository.find_by_version_id(version_id, target)
+}
+
+/// Cached sha1 per selected Modrinth mod, on this target, keyed by the mod id
+/// used in the rules.
+///
+/// One connection for the whole pass, unlike `load_cached_mod_record_for_target`
+/// which opens one per mod. The hash comes from the row itself: see
+/// `find_cached_file_hash_by_project` for why the disk-checking lookup is the
+/// wrong tool here. Mods with no row, or a row whose `file_hash` is NULL, are
+/// simply absent from the map.
+pub(super) fn load_cached_file_hashes_for_selected(
+    launcher_paths: &LauncherPaths,
+    selected_mods: &[SelectedMod],
+    target: &ResolutionTarget,
+) -> Result<HashMap<String, String>> {
+    let mut hashes = HashMap::new();
+    if selected_mods.is_empty() {
+        return Ok(hashes);
+    }
+
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
+
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth) || hashes.contains_key(&selected.mod_id)
+        {
+            continue;
+        }
+        if let Some(hash) =
+            repository.find_cached_file_hash_by_project_or_alias(&selected.mod_id, target)?
+        {
+            hashes.insert(selected.mod_id.clone(), hash);
+        }
+    }
+
+    Ok(hashes)
 }
 
 pub(super) fn load_cached_dependency_requests(

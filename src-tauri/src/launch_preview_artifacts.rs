@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -18,7 +19,8 @@ use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
 
 use super::{
     embedded_minecraft_requirements_match, emit_log, ensure_remote_version_cached,
-    load_cached_mod_record_for_target, read_embedded_fabric_requirements, SelectedMod,
+    load_cached_file_hashes_for_selected, load_cached_mod_record_for_target,
+    read_embedded_fabric_requirements, SelectedMod,
 };
 
 pub(super) struct TopLevelVersionCandidates {
@@ -141,6 +143,207 @@ pub(super) async fn prefetch_compatible_versions_for_selected(
     }
 
     Ok(versions)
+}
+
+/// Selected Modrinth mods split by whether `mod_cache` knows a sha1 for them on
+/// this target. One entry per mod id, in resolution order.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct CachedHashSplit {
+    /// `(mod_id, lowercased sha1)` — the bulk path.
+    pub(super) hashed: Vec<(String, String)>,
+    /// No row for this target, or a row whose `file_hash` is NULL — the
+    /// per-project path.
+    pub(super) unhashed: Vec<String>,
+}
+
+/// What the bulk stage answered, and what it left to the per-project stage.
+pub(super) struct HashStageOutcome {
+    pub(super) resolved: HashMap<String, ModrinthVersion>,
+    pub(super) per_project_mod_ids: Vec<String>,
+    /// Set when the bulk call itself failed and its whole set fell back.
+    pub(super) bulk_error: Option<String>,
+}
+
+pub(super) fn split_selected_by_cached_hash(
+    selected_mods: &[SelectedMod],
+    hash_by_mod_id: &HashMap<String, String>,
+) -> CachedHashSplit {
+    let mut split = CachedHashSplit::default();
+    let mut seen = HashSet::new();
+
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth) {
+            continue;
+        }
+        if !seen.insert(selected.mod_id.as_str()) {
+            continue;
+        }
+
+        match hash_by_mod_id.get(&selected.mod_id) {
+            Some(hash) => split.hashed.push((selected.mod_id.clone(), hash.clone())),
+            None => split.unhashed.push(selected.mod_id.clone()),
+        }
+    }
+
+    split
+}
+
+/// Re-key a hash-keyed bulk response by mod id.
+///
+/// A hash the response omitted yields no entry, so the mod lands in the
+/// caller's `unavailable` set — the same place a per-project lookup with no
+/// compatible version puts it. Two mod ids sharing one hash both resolve.
+pub(super) fn versions_by_mod_id(
+    hashed: &[(String, String)],
+    versions_by_hash: &HashMap<String, ModrinthVersion>,
+) -> HashMap<String, ModrinthVersion> {
+    hashed
+        .iter()
+        .filter_map(|(mod_id, hash)| {
+            versions_by_hash
+                .get(hash)
+                .map(|version| (mod_id.clone(), version.clone()))
+        })
+        .collect()
+}
+
+/// Bulk results win; the per-project stage only fills mod ids the bulk stage
+/// left out. The two key sets are disjoint in the normal path and overlap only
+/// after a failed bulk call sent its whole set to the fallback.
+pub(super) fn merge_resolved_versions(
+    mut bulk: HashMap<String, ModrinthVersion>,
+    per_project: HashMap<String, ModrinthVersion>,
+) -> HashMap<String, ModrinthVersion> {
+    for (mod_id, version) in per_project {
+        bulk.entry(mod_id).or_insert(version);
+    }
+    bulk
+}
+
+/// The bulk stage: one cascade for every mod that has a cached hash.
+///
+/// Generic over the request so the fallback is testable without network. A
+/// per-project error costs one mod today
+/// (`prefetch_compatible_versions_for_selected`); a bulk error would cost the
+/// whole modlist, so a failed call sends its set to the per-project path
+/// instead of shrinking the launch. That path is slow, but it is an error path.
+pub(super) async fn resolve_versions_for_cached_hashes<Fetch, Fut>(
+    split: &CachedHashSplit,
+    fetch_bulk: Fetch,
+) -> HashStageOutcome
+where
+    Fetch: FnOnce(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<HashMap<String, ModrinthVersion>>>,
+{
+    if split.hashed.is_empty() {
+        return HashStageOutcome {
+            resolved: HashMap::new(),
+            per_project_mod_ids: split.unhashed.clone(),
+            bulk_error: None,
+        };
+    }
+
+    let hashes = split
+        .hashed
+        .iter()
+        .map(|(_, hash)| hash.clone())
+        .collect::<Vec<_>>();
+
+    match fetch_bulk(hashes).await {
+        Ok(versions_by_hash) => HashStageOutcome {
+            resolved: versions_by_mod_id(&split.hashed, &versions_by_hash),
+            per_project_mod_ids: split.unhashed.clone(),
+            bulk_error: None,
+        },
+        Err(error) => {
+            let mut per_project_mod_ids = split
+                .hashed
+                .iter()
+                .map(|(mod_id, _)| mod_id.clone())
+                .collect::<Vec<_>>();
+            per_project_mod_ids.extend(split.unhashed.iter().cloned());
+
+            HashStageOutcome {
+                resolved: HashMap::new(),
+                per_project_mod_ids,
+                bulk_error: Some(format!("{error:#}")),
+            }
+        }
+    }
+}
+
+/// Same contract as `prefetch_compatible_versions_for_selected` — mod id →
+/// preferred `ModrinthVersion` — reached through `mod_cache` + the bulk
+/// endpoint, falling back to one request per mod only for the mods no cached
+/// hash covers.
+pub(super) async fn resolve_compatible_versions_hybrid(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    selected_mods: &[SelectedMod],
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+) -> Result<HashMap<String, ModrinthVersion>> {
+    let hash_by_mod_id =
+        load_cached_file_hashes_for_selected(launcher_paths, selected_mods, target)?;
+    let split = split_selected_by_cached_hash(selected_mods, &hash_by_mod_id);
+    let outcome = resolve_versions_for_cached_hashes(&split, |hashes| async move {
+        client.fetch_latest_versions_by_hash(&hashes, target).await
+    })
+    .await;
+
+    if let Some(error) = &outcome.bulk_error {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Launch] bulk version lookup failed for {} cached hashes; falling back to one request per mod ({error})",
+                split.hashed.len()
+            ),
+        );
+    } else {
+        // The endpoint reports neither "unknown hash" nor "no version for this
+        // target": both are omissions. Naming the omitted mods is the only
+        // diagnostic available before they are disabled and re-resolved.
+        let omitted = split
+            .hashed
+            .iter()
+            .map(|(mod_id, _)| mod_id.as_str())
+            .filter(|mod_id| !outcome.resolved.contains_key(*mod_id))
+            .collect::<Vec<_>>();
+        if !omitted.is_empty() {
+            let _ = emit_log(
+                app_handle,
+                ProcessLogStream::Stderr,
+                format!(
+                    "[Launch] bulk version lookup returned no version for {}",
+                    omitted.join(", ")
+                ),
+            );
+        }
+    }
+
+    let per_project_mod_ids = outcome
+        .per_project_mod_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let per_project_selection = selected_mods
+        .iter()
+        .filter(|selected| per_project_mod_ids.contains(selected.mod_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let per_project = prefetch_compatible_versions_for_selected(
+        app_handle,
+        launcher_paths,
+        http_client,
+        &per_project_selection,
+        client,
+        target,
+    )
+    .await?;
+
+    Ok(merge_resolved_versions(outcome.resolved, per_project))
 }
 
 pub(super) async fn prefetch_ranked_versions_for_selected(
@@ -527,5 +730,174 @@ mod tests {
 
         assert_eq!(first, Some(june.clone()));
         assert_eq!(second, Some(june));
+    }
+
+    fn modrinth_mod(mod_id: &str) -> SelectedMod {
+        SelectedMod {
+            mod_id: mod_id.into(),
+            source: ModSource::Modrinth,
+        }
+    }
+
+    fn local_mod(mod_id: &str) -> SelectedMod {
+        SelectedMod {
+            mod_id: mod_id.into(),
+            source: ModSource::Local,
+        }
+    }
+
+    fn cached_hashes(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(mod_id, hash)| ((*mod_id).to_string(), (*hash).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn split_sends_every_mod_with_a_cached_hash_to_the_bulk_path() {
+        let selected = vec![modrinth_mod("sodium"), modrinth_mod("lithium")];
+        let split = split_selected_by_cached_hash(
+            &selected,
+            &cached_hashes(&[("sodium", "aaa1"), ("lithium", "bbb2")]),
+        );
+
+        assert_eq!(
+            split.hashed,
+            vec![
+                ("sodium".to_string(), "aaa1".to_string()),
+                ("lithium".to_string(), "bbb2".to_string()),
+            ]
+        );
+        assert!(split.unhashed.is_empty());
+    }
+
+    #[test]
+    fn split_sends_every_mod_to_the_per_project_path_without_cached_hashes() {
+        let selected = vec![modrinth_mod("polytone"), modrinth_mod("connector-extras")];
+        let split = split_selected_by_cached_hash(&selected, &HashMap::new());
+
+        assert!(split.hashed.is_empty());
+        assert_eq!(split.unhashed, vec!["polytone", "connector-extras"]);
+    }
+
+    #[test]
+    fn split_separates_mixed_coverage_and_ignores_local_and_repeated_mods() {
+        let selected = vec![
+            modrinth_mod("sodium"),
+            local_mod("my-own.jar"),
+            modrinth_mod("polytone"),
+            modrinth_mod("sodium"),
+        ];
+        let split =
+            split_selected_by_cached_hash(&selected, &cached_hashes(&[("sodium", "aaa1")]));
+
+        assert_eq!(split.hashed, vec![("sodium".to_string(), "aaa1".to_string())]);
+        assert_eq!(split.unhashed, vec!["polytone"]);
+    }
+
+    #[tokio::test]
+    async fn a_hash_omitted_by_the_bulk_response_leaves_its_mod_unresolved() {
+        let selected = vec![modrinth_mod("sodium"), modrinth_mod("lithium")];
+        let split = split_selected_by_cached_hash(
+            &selected,
+            &cached_hashes(&[("sodium", "aaa1"), ("lithium", "bbb2")]),
+        );
+
+        let outcome = resolve_versions_for_cached_hashes(&split, |_hashes| async {
+            Ok(HashMap::from([(
+                "aaa1".to_string(),
+                test_version("sodium-version", "2026-01-01T00:00:00Z"),
+            )]))
+        })
+        .await;
+
+        assert_eq!(outcome.resolved.len(), 1);
+        assert!(outcome.resolved.contains_key("sodium"));
+        // The omitted mod must reach the caller's `unavailable` set, not a
+        // second per-project request and not silence.
+        assert!(!outcome.resolved.contains_key("lithium"));
+        assert!(outcome.per_project_mod_ids.is_empty());
+        assert!(outcome.bulk_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn two_mod_ids_sharing_a_cached_hash_both_resolve() {
+        let selected = vec![modrinth_mod("sodium"), modrinth_mod("AANobbMI")];
+        let split = split_selected_by_cached_hash(
+            &selected,
+            &cached_hashes(&[("sodium", "aaa1"), ("AANobbMI", "aaa1")]),
+        );
+
+        let outcome = resolve_versions_for_cached_hashes(&split, |hashes| async move {
+            assert_eq!(hashes, vec!["aaa1".to_string(), "aaa1".to_string()]);
+            Ok(HashMap::from([(
+                "aaa1".to_string(),
+                test_version("sodium-version", "2026-01-01T00:00:00Z"),
+            )]))
+        })
+        .await;
+
+        assert_eq!(outcome.resolved.len(), 2);
+        assert_eq!(
+            outcome.resolved.get("sodium"),
+            outcome.resolved.get("AANobbMI")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_bulk_call_sends_its_whole_set_to_the_per_project_path() {
+        let selected = vec![
+            modrinth_mod("sodium"),
+            modrinth_mod("lithium"),
+            modrinth_mod("polytone"),
+        ];
+        let split = split_selected_by_cached_hash(
+            &selected,
+            &cached_hashes(&[("sodium", "aaa1"), ("lithium", "bbb2")]),
+        );
+
+        let outcome = resolve_versions_for_cached_hashes(&split, |_hashes| async {
+            Err(anyhow::anyhow!("connection reset"))
+        })
+        .await;
+
+        assert!(outcome.resolved.is_empty());
+        assert_eq!(
+            outcome.per_project_mod_ids,
+            vec!["sodium", "lithium", "polytone"]
+        );
+        assert_eq!(outcome.bulk_error.as_deref(), Some("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_bulk_set_costs_no_request() {
+        let selected = vec![modrinth_mod("polytone")];
+        let split = split_selected_by_cached_hash(&selected, &HashMap::new());
+
+        let outcome = resolve_versions_for_cached_hashes(&split, |_hashes| async {
+            panic!("the bulk endpoint must not be called without hashes");
+        })
+        .await;
+
+        assert!(outcome.resolved.is_empty());
+        assert_eq!(outcome.per_project_mod_ids, vec!["polytone"]);
+    }
+
+    #[test]
+    fn per_project_results_only_fill_mod_ids_the_bulk_left_out() {
+        let from_bulk = test_version("from-bulk", "2026-01-01T00:00:00Z");
+        let from_per_project = test_version("from-per-project", "2026-01-01T00:00:00Z");
+
+        let merged = merge_resolved_versions(
+            HashMap::from([("sodium".to_string(), from_bulk.clone())]),
+            HashMap::from([
+                ("sodium".to_string(), from_per_project.clone()),
+                ("polytone".to_string(), from_per_project.clone()),
+            ]),
+        );
+
+        assert_eq!(merged.get("sodium"), Some(&from_bulk));
+        assert_eq!(merged.get("polytone"), Some(&from_per_project));
+        assert_eq!(merged.len(), 2);
     }
 }
