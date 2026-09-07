@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::resolver::{ModLoader, ResolutionTarget};
 
@@ -173,6 +174,20 @@ pub fn sort_versions_by_target_preference(
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REQUEST_ATTEMPTS: u32 = 4;
 
+/// Channel cascade for `version_files/update`, in the same order as
+/// `ModrinthVersion::channel_rank` (release > beta > alpha). The endpoint
+/// treats `version_types` as a set filter and then always prefers the most
+/// recent version inside that set, so the ranking has to be rebuilt by asking
+/// one channel at a time.
+const VERSION_TYPE_CASCADE: [&str; 3] = ["release", "beta", "alpha"];
+
+/// Guard against a pathological hash set, not the normal case: the endpoint has
+/// no cap on the number of hashes, only a 2 MiB request-body limit (measured
+/// 2026-09-07: 47 660 sha1 hashes are accepted, 47 661 return `400
+/// request_error`). A 300-mod modlist is ~13 KB; 1 000 hashes is ~44 KB, two
+/// orders of magnitude below the limit, so this never splits a real modlist.
+const MAX_HASHES_PER_UPDATE_REQUEST: usize = 1_000;
+
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("cubic-launcher/0.1.0 (https://github.com/arius-c/Cubic-Launcher)")
@@ -181,15 +196,18 @@ fn build_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-// Retry once on HTTP 429 to be polite to Modrinth's rate limiter.
-async fn send_with_retry(
-    http_client: &reqwest::Client,
-    url: reqwest::Url,
-) -> reqwest::Result<reqwest::Response> {
+// Retry on HTTP 429 to be polite to Modrinth's rate limiter, and on transient
+// server/transport failures. `build_request` is invoked fresh on every attempt
+// because `RequestBuilder` is not `Clone` once a body is attached, which is the
+// case for the POST endpoints.
+async fn send_with_retry<F>(build_request: F) -> reqwest::Result<reqwest::Response>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
     let mut backoff = Duration::from_secs(2);
 
     for attempt in 1..=MAX_REQUEST_ATTEMPTS {
-        match http_client.get(url.clone()).send().await {
+        match build_request().send().await {
             Ok(response) => {
                 if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     if attempt == MAX_REQUEST_ATTEMPTS {
@@ -227,7 +245,7 @@ async fn send_with_retry(
         }
     }
 
-    http_client.get(url).send().await
+    build_request().send().await
 }
 
 #[derive(Debug, Clone)]
@@ -261,7 +279,7 @@ impl ModrinthClient {
         }
 
         let url = build_project_versions_url(&self.base_url, project_id, target)?;
-        let response = send_with_retry(&self.http_client, url)
+        let response = send_with_retry(|| self.http_client.get(url.clone()))
             .await
             .with_context(|| {
                 format!("failed to query Modrinth versions for project '{project_id}'")
@@ -306,7 +324,7 @@ impl ModrinthClient {
         let game_versions_json = serde_json::to_string(&vec![minecraft_version])?;
         url.query_pairs_mut()
             .append_pair("game_versions", &game_versions_json);
-        let response = send_with_retry(&self.http_client, url)
+        let response = send_with_retry(|| self.http_client.get(url.clone()))
             .await
             .with_context(|| {
                 format!("failed to query Modrinth versions for content pack '{project_id}'")
@@ -338,7 +356,7 @@ impl ModrinthClient {
         }
 
         let url = build_version_url(&self.base_url, version_id)?;
-        let response = send_with_retry(&self.http_client, url)
+        let response = send_with_retry(|| self.http_client.get(url.clone()))
             .await
             .with_context(|| format!("failed to query Modrinth version '{version_id}'"))?;
 
@@ -356,6 +374,61 @@ impl ModrinthClient {
             .with_context(|| format!("failed to deserialize Modrinth version '{version_id}'"))?;
 
         Ok(Some(version))
+    }
+
+    /// Latest version per sha1 hash for a whole modlist, in **three** requests
+    /// instead of one per project.
+    ///
+    /// The result is keyed by hash, not by mod id: only the caller knows which
+    /// hash belongs to which rule. A hash that Modrinth does not know, or for
+    /// which no version exists on this target, is simply absent — the endpoint
+    /// reports neither, and the returned map is the only source of truth.
+    ///
+    /// The channel cascade (`VERSION_TYPE_CASCADE`) reproduces
+    /// `select_preferred_version`: a release wins over a newer beta, which a
+    /// single request cannot express because `version_types` filters instead of
+    /// ranking. Channels are asked one at a time and each stage only carries
+    /// the hashes the previous ones left unanswered, so a channel with nothing
+    /// left to ask costs no request.
+    pub async fn fetch_latest_versions_by_hash(
+        &self,
+        sha1_hashes: &[String],
+        target: &ResolutionTarget,
+    ) -> Result<HashMap<String, ModrinthVersion>> {
+        resolve_hash_cascade(sha1_hashes, |chunk, version_type| {
+            self.post_version_files_update(chunk, target, version_type)
+        })
+        .await
+    }
+
+    async fn post_version_files_update(
+        &self,
+        sha1_hashes: Vec<String>,
+        target: &ResolutionTarget,
+        version_type: &'static str,
+    ) -> Result<HashMap<String, ModrinthVersion>> {
+        let url = build_version_files_update_url(&self.base_url)?;
+        let body = build_version_files_update_body(&sha1_hashes, target, version_type);
+
+        let response = send_with_retry(|| self.http_client.post(url.clone()).json(&body))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query Modrinth {version_type} updates for {} hashes",
+                    sha1_hashes.len()
+                )
+            })?
+            .error_for_status()
+            .with_context(|| {
+                format!("Modrinth returned an error for a {version_type} bulk version lookup")
+            })?;
+
+        response
+            .json::<HashMap<String, ModrinthVersion>>()
+            .await
+            .with_context(|| {
+                format!("failed to deserialize Modrinth {version_type} bulk version lookup")
+            })
     }
 }
 
@@ -439,13 +512,31 @@ pub struct ModrinthFile {
     pub size: u64,
 }
 
+/// An unrecognized `dependency_type` maps to `Unknown` instead of failing the
+/// deserialization. With one request per project a rejected payload cost one
+/// mod; with a single bulk request it would cost the whole modlist. `Unknown`
+/// is treated like any non-`Required` type by the dependency notices
+/// (`launch_preview_dependencies.rs:224`, `:331`).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(from = "String")]
 pub enum DependencyType {
     Required,
     Optional,
     Incompatible,
     Embedded,
+    Unknown,
+}
+
+impl From<String> for DependencyType {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "required" => Self::Required,
+            "optional" => Self::Optional,
+            "incompatible" => Self::Incompatible,
+            "embedded" => Self::Embedded,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 pub fn build_project_versions_url(
@@ -473,6 +564,126 @@ pub fn build_version_url(base_url: &str, version_id: &str) -> Result<Url> {
     let sanitized_base_url = base_url.trim_end_matches('/');
     Url::parse(&format!("{sanitized_base_url}/version/{version_id}"))
         .with_context(|| format!("invalid Modrinth base URL '{base_url}'"))
+}
+
+pub fn build_version_files_update_url(base_url: &str) -> Result<Url> {
+    let sanitized_base_url = base_url.trim_end_matches('/');
+    Url::parse(&format!("{sanitized_base_url}/version_files/update"))
+        .with_context(|| format!("invalid Modrinth base URL '{base_url}'"))
+}
+
+/// Body of `POST /version_files/update`. `loaders` is always populated: an
+/// absent or empty array is not "no filter wanted" but "no filter", and the
+/// endpoint then answers with builds for other loaders.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct VersionFilesUpdateRequest<'a> {
+    hashes: &'a [String],
+    algorithm: &'static str,
+    loaders: [&'static str; 1],
+    game_versions: [&'a str; 1],
+    version_types: [&'a str; 1],
+}
+
+pub(crate) fn build_version_files_update_body<'a>(
+    hashes: &'a [String],
+    target: &'a ResolutionTarget,
+    version_type: &'a str,
+) -> VersionFilesUpdateRequest<'a> {
+    VersionFilesUpdateRequest {
+        hashes,
+        algorithm: "sha1",
+        loaders: [target.mod_loader.as_modrinth_loader()],
+        game_versions: [target.minecraft_version.as_str()],
+        version_types: [version_type],
+    }
+}
+
+/// Modrinth matches hashes case-sensitively: a valid sha1 sent uppercase is
+/// omitted from the response exactly like an unknown one, with no error. So the
+/// caller's input is normalized here instead of being trusted. Duplicates and
+/// blanks are dropped because they can only waste body bytes.
+pub(crate) fn normalize_sha1_hashes(hashes: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(hashes.len());
+    let mut seen = HashSet::with_capacity(hashes.len());
+
+    for hash in hashes {
+        let trimmed = hash.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lowercase = trimmed.to_ascii_lowercase();
+        if seen.insert(lowercase.clone()) {
+            normalized.push(lowercase);
+        }
+    }
+
+    normalized
+}
+
+pub(crate) fn hash_chunks(hashes: &[String], max_per_request: usize) -> Vec<&[String]> {
+    if hashes.is_empty() {
+        return Vec::new();
+    }
+    hashes.chunks(max_per_request.max(1)).collect()
+}
+
+/// Fold one cascade stage into the accumulated map and return the hashes still
+/// unanswered, in the original order. Earlier stages win, so a hash resolved on
+/// `release` is never overwritten by `beta`. Response keys that were not asked
+/// for are ignored: the returned map is the only source of truth about what was
+/// found, and nothing else validates it.
+pub(crate) fn apply_cascade_stage(
+    pending: &[String],
+    mut stage: HashMap<String, ModrinthVersion>,
+    found: &mut HashMap<String, ModrinthVersion>,
+) -> Vec<String> {
+    let mut still_pending = Vec::new();
+
+    for hash in pending {
+        if found.contains_key(hash) {
+            continue;
+        }
+        match stage.remove(hash) {
+            Some(version) => {
+                found.insert(hash.clone(), version);
+            }
+            None => still_pending.push(hash.clone()),
+        }
+    }
+
+    still_pending
+}
+
+/// Drives the channel cascade: normalize, then for each channel ask only the
+/// hashes still unanswered, chunked as a guard, and let earlier channels win.
+/// `fetch_stage` is the only part that talks to the network, which is what
+/// makes the sequencing testable: the driver decides how many requests happen
+/// and with which hashes, and an empty residual set costs no request.
+pub(crate) async fn resolve_hash_cascade<F, Fut>(
+    sha1_hashes: &[String],
+    mut fetch_stage: F,
+) -> Result<HashMap<String, ModrinthVersion>>
+where
+    F: FnMut(Vec<String>, &'static str) -> Fut,
+    Fut: Future<Output = Result<HashMap<String, ModrinthVersion>>>,
+{
+    let mut pending = normalize_sha1_hashes(sha1_hashes);
+    let mut found = HashMap::with_capacity(pending.len());
+
+    for version_type in VERSION_TYPE_CASCADE {
+        if pending.is_empty() {
+            break;
+        }
+
+        let mut stage = HashMap::new();
+        for chunk in hash_chunks(&pending, MAX_HASHES_PER_UPDATE_REQUEST) {
+            stage.extend(fetch_stage(chunk.to_vec(), version_type).await?);
+        }
+
+        pending = apply_cascade_stage(&pending, stage, &mut found);
+    }
+
+    Ok(found)
 }
 
 pub fn filter_compatible_versions(
@@ -520,12 +731,15 @@ impl ModLoader {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashMap;
 
     use super::{
-        build_project_versions_url, build_version_url, filter_compatible_versions,
-        select_latest_compatible_version, sort_versions_by_target_preference, DependencyType,
-        ModrinthVersion,
+        build_project_versions_url, build_version_files_update_body,
+        build_version_files_update_url, build_version_url, filter_compatible_versions,
+        resolve_hash_cascade, select_latest_compatible_version,
+        sort_versions_by_target_preference, DependencyType, ModrinthVersion,
+        MAX_HASHES_PER_UPDATE_REQUEST,
     };
     use crate::resolver::{ModLoader, ResolutionTarget};
 
@@ -757,5 +971,296 @@ mod tests {
         sort_versions_by_target_preference(&mut versions, &target);
 
         assert_eq!(versions[0].id, "target");
+    }
+
+    fn bulk_version(id: &str, version_type: &str, date_published: &str) -> ModrinthVersion {
+        ModrinthVersion {
+            id: id.into(),
+            project_id: "project".into(),
+            version_number: id.into(),
+            name: id.into(),
+            game_versions: vec!["1.21.1".into()],
+            loaders: vec!["fabric".into()],
+            version_type: version_type.into(),
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            date_published: date_published.into(),
+        }
+    }
+
+    /// Stands in for the network stage: records every request the cascade
+    /// issues and answers like the endpoint does, i.e. only for the hashes it
+    /// was asked about, omitting everything else without an error.
+    struct StageRecorder {
+        replies: HashMap<&'static str, Vec<(String, ModrinthVersion)>>,
+        calls: RefCell<Vec<(&'static str, Vec<String>)>>,
+    }
+
+    impl StageRecorder {
+        fn new(replies: Vec<(&'static str, Vec<(String, ModrinthVersion)>)>) -> Self {
+            Self {
+                replies: replies.into_iter().collect(),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn reply(
+            &self,
+            requested: Vec<String>,
+            version_type: &'static str,
+        ) -> HashMap<String, ModrinthVersion> {
+            self.calls
+                .borrow_mut()
+                .push((version_type, requested.clone()));
+
+            self.replies
+                .get(version_type)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|(hash, _)| requested.contains(hash))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        fn channels(&self) -> Vec<&'static str> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|(version_type, _)| *version_type)
+                .collect()
+        }
+
+        fn requested(&self) -> Vec<Vec<String>> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|(_, hashes)| hashes.clone())
+                .collect()
+        }
+    }
+
+    async fn run_cascade(
+        hashes: &[String],
+        recorder: &StageRecorder,
+    ) -> HashMap<String, ModrinthVersion> {
+        resolve_hash_cascade(hashes, |chunk, version_type| {
+            let stage = recorder.reply(chunk, version_type);
+            async move { Ok(stage) }
+        })
+        .await
+        .expect("cascade should succeed")
+    }
+
+    #[test]
+    fn builds_version_files_update_url() {
+        let url = build_version_files_update_url("https://api.modrinth.com/v2/")
+            .expect("url should build");
+
+        assert_eq!(
+            url.as_str(),
+            "https://api.modrinth.com/v2/version_files/update"
+        );
+    }
+
+    #[test]
+    fn update_body_pins_algorithm_loader_and_single_channel() {
+        let hashes = vec!["aa".to_string(), "bb".to_string()];
+        let target = target();
+        let body = build_version_files_update_body(&hashes, &target, "beta");
+
+        assert_eq!(
+            serde_json::to_value(&body).expect("body should serialize"),
+            serde_json::json!({
+                "hashes": ["aa", "bb"],
+                "algorithm": "sha1",
+                "loaders": ["fabric"],
+                "game_versions": ["1.21.1"],
+                "version_types": ["beta"]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_stops_at_the_first_channel_that_answers_everything() {
+        let hashes = vec!["aaa".to_string(), "bbb".to_string()];
+        let recorder = StageRecorder::new(vec![(
+            "release",
+            vec![
+                ("aaa".to_string(), bulk_version("a-rel", "release", "2025-01-01")),
+                ("bbb".to_string(), bulk_version("b-rel", "release", "2025-01-02")),
+            ],
+        )]);
+
+        let found = run_cascade(&hashes, &recorder).await;
+
+        assert_eq!(recorder.channels(), vec!["release"]);
+        assert_eq!(found["aaa"].id, "a-rel");
+        assert_eq!(found["bbb"].id, "b-rel");
+    }
+
+    #[tokio::test]
+    async fn cascade_keeps_an_older_release_over_a_newer_beta() {
+        let hashes = vec!["aaa".to_string()];
+        let recorder = StageRecorder::new(vec![
+            (
+                "release",
+                vec![(
+                    "aaa".to_string(),
+                    bulk_version("old-release", "release", "2025-02-20T00:00:00Z"),
+                )],
+            ),
+            (
+                "beta",
+                vec![(
+                    "aaa".to_string(),
+                    bulk_version("new-beta", "beta", "2026-06-13T00:00:00Z"),
+                )],
+            ),
+        ]);
+
+        let found = run_cascade(&hashes, &recorder).await;
+
+        assert_eq!(recorder.channels(), vec!["release"]);
+        assert_eq!(found["aaa"].id, "old-release");
+    }
+
+    #[tokio::test]
+    async fn cascade_asks_later_channels_only_for_the_hashes_still_unanswered() {
+        let hashes = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
+        let recorder = StageRecorder::new(vec![
+            (
+                "release",
+                vec![(
+                    "aaa".to_string(),
+                    bulk_version("a-rel", "release", "2025-01-01"),
+                )],
+            ),
+            (
+                "beta",
+                vec![("bbb".to_string(), bulk_version("b-beta", "beta", "2025-02-01"))],
+            ),
+            (
+                "alpha",
+                vec![(
+                    "ccc".to_string(),
+                    bulk_version("c-alpha", "alpha", "2025-03-01"),
+                )],
+            ),
+        ]);
+
+        let found = run_cascade(&hashes, &recorder).await;
+
+        assert_eq!(recorder.channels(), vec!["release", "beta", "alpha"]);
+        assert_eq!(
+            recorder.requested(),
+            vec![
+                vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()],
+                vec!["bbb".to_string(), "ccc".to_string()],
+                vec!["ccc".to_string()],
+            ]
+        );
+        assert_eq!(found["aaa"].id, "a-rel");
+        assert_eq!(found["bbb"].id, "b-beta");
+        assert_eq!(found["ccc"].id, "c-alpha");
+    }
+
+    #[tokio::test]
+    async fn cascade_returns_an_empty_map_when_no_channel_knows_the_hash() {
+        let hashes = vec!["deadbeef".to_string()];
+        let recorder = StageRecorder::new(Vec::new());
+
+        let found = run_cascade(&hashes, &recorder).await;
+
+        assert_eq!(recorder.channels(), vec!["release", "beta", "alpha"]);
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cascade_issues_no_request_without_usable_hashes() {
+        let recorder = StageRecorder::new(Vec::new());
+
+        let found = run_cascade(&[" ".to_string(), String::new()], &recorder).await;
+
+        assert!(recorder.channels().is_empty());
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cascade_lowercases_and_deduplicates_the_requested_hashes() {
+        let hashes = vec![
+            "AABBCC".to_string(),
+            " aabbcc ".to_string(),
+            "DDEEFF".to_string(),
+        ];
+        let recorder = StageRecorder::new(vec![(
+            "release",
+            vec![(
+                "aabbcc".to_string(),
+                bulk_version("a-rel", "release", "2025-01-01"),
+            )],
+        )]);
+
+        let found = run_cascade(&hashes, &recorder).await;
+
+        assert_eq!(
+            recorder.requested()[0],
+            vec!["aabbcc".to_string(), "ddeeff".to_string()]
+        );
+        assert_eq!(found["aabbcc"].id, "a-rel");
+        assert!(!found.contains_key("AABBCC"));
+    }
+
+    #[tokio::test]
+    async fn cascade_splits_a_hash_set_above_the_request_guard() {
+        let hashes: Vec<String> = (0..MAX_HASHES_PER_UPDATE_REQUEST + 7)
+            .map(|index| format!("{index:040x}"))
+            .collect();
+        let recorder = StageRecorder::new(Vec::new());
+
+        run_cascade(&hashes, &recorder).await;
+
+        let release_sizes: Vec<usize> = recorder
+            .calls
+            .borrow()
+            .iter()
+            .filter(|(version_type, _)| *version_type == "release")
+            .map(|(_, requested)| requested.len())
+            .collect();
+
+        assert_eq!(release_sizes, vec![MAX_HASHES_PER_UPDATE_REQUEST, 7]);
+        assert_eq!(
+            release_sizes.iter().sum::<usize>(),
+            MAX_HASHES_PER_UPDATE_REQUEST + 7
+        );
+    }
+
+    #[test]
+    fn unknown_dependency_type_does_not_fail_the_whole_payload() {
+        let value = serde_json::json!({
+            "id": "version",
+            "project_id": "project",
+            "version_number": "1.0.0",
+            "name": "Version",
+            "game_versions": ["1.21.1"],
+            "loaders": ["fabric"],
+            "version_type": "release",
+            "date_published": "2026-06-01T10:00:00.000Z",
+            "dependencies": [
+                { "project_id": "other", "dependency_type": "suggested" },
+                { "project_id": "fabric-api", "dependency_type": "required" }
+            ]
+        });
+
+        let version: ModrinthVersion =
+            serde_json::from_value(value).expect("version should deserialize");
+
+        assert_eq!(version.dependencies[0].dependency_type, DependencyType::Unknown);
+        assert_eq!(
+            version.dependencies[1].dependency_type,
+            DependencyType::Required
+        );
     }
 }
