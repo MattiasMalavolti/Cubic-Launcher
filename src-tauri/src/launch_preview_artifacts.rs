@@ -191,21 +191,25 @@ pub(super) fn split_selected_by_cached_hash(
     split
 }
 
-/// Re-key a hash-keyed bulk response by mod id.
+/// Re-key a keyed Modrinth response by mod id, dropping the mod ids the
+/// response left out.
 ///
-/// A hash the response omitted yields no entry; the caller retries that mod per
-/// project instead of declaring it unavailable, because the response cannot
-/// distinguish "no version for this target" from "this hash is no longer
-/// known". Two mod ids sharing one hash both resolve.
+/// Used with two kinds of key. A **sha1** from the bulk endpoint: an omitted
+/// hash yields no entry and the caller retries that mod per project instead of
+/// declaring it unavailable, because the response cannot distinguish "no
+/// version for this target" from "this hash is no longer known". A **version
+/// id** handed down by the pre-check: an omission there means Modrinth dropped
+/// the exact version the popup showed. Two mod ids sharing one key both
+/// resolve either way.
 pub(super) fn versions_by_mod_id(
-    hashed: &[(String, String)],
-    versions_by_hash: &HashMap<String, ModrinthVersion>,
+    keyed: &[(String, String)],
+    versions_by_key: &HashMap<String, ModrinthVersion>,
 ) -> HashMap<String, ModrinthVersion> {
-    hashed
+    keyed
         .iter()
-        .filter_map(|(mod_id, hash)| {
-            versions_by_hash
-                .get(hash)
+        .filter_map(|(mod_id, key)| {
+            versions_by_key
+                .get(key)
                 .map(|version| (mod_id.clone(), version.clone()))
         })
         .collect()
@@ -643,6 +647,142 @@ pub(super) fn reresolve_without_unavailable(
     resolve_modlist(&patched, target)
 }
 
+/// Selected Modrinth mods split by whether the pre-check already chose a
+/// version for them.
+///
+/// `covered` is `(mod_id, version_id)`, one entry per mod id, in resolution
+/// order — the same shape `versions_by_mod_id` consumes. `uncovered` is
+/// everything else: mods the pre-check never saw, which means the mod-list
+/// changed between the pre-check and the launch. That is a real case, not an
+/// error, and those mods are resolved the usual way.
+pub(super) fn split_selected_by_preresolved(
+    selected_mods: &[SelectedMod],
+    preresolved: &HashMap<String, String>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut covered = Vec::new();
+    let mut uncovered = Vec::new();
+    let mut seen = HashSet::new();
+
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth) {
+            continue;
+        }
+        if !seen.insert(selected.mod_id.as_str()) {
+            continue;
+        }
+
+        match preresolved.get(&selected.mod_id) {
+            Some(version_id) => covered.push((selected.mod_id.clone(), version_id.clone())),
+            None => uncovered.push(selected.mod_id.clone()),
+        }
+    }
+
+    (covered, uncovered)
+}
+
+fn selection_subset(selected_mods: &[SelectedMod], mod_ids: &[String]) -> Vec<SelectedMod> {
+    let wanted = mod_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+
+    selected_mods
+        .iter()
+        .filter(|selected| wanted.contains(selected.mod_id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The mod ids the normal resolver still has to answer for, in the order they
+/// will be logged: first the pre-checked versions Modrinth no longer returns,
+/// then the mods the pre-check never covered.
+///
+/// The first group is the one that matters and the one nobody would think of:
+/// the popup showed a version, the user agreed to it, and it is gone. Falling
+/// back keeps the mod in the launch instead of dropping it silently.
+pub(super) fn mod_ids_needing_resolution(
+    covered: &[(String, String)],
+    resolved: &HashMap<String, ModrinthVersion>,
+    uncovered: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let dropped = covered
+        .iter()
+        .map(|(mod_id, _)| mod_id)
+        .filter(|mod_id| !resolved.contains_key(mod_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut all = dropped.clone();
+    all.extend(uncovered.iter().cloned());
+
+    (all, dropped)
+}
+
+/// The versions the launch will install, taken from the ids the pre-check
+/// already chose (D16) instead of choosing again.
+///
+/// `GET /versions?ids=` fetches those exact versions in one request — it is a
+/// lookup, not a selection, so nothing here can pick a different version than
+/// the popup showed. Modrinth still has to be asked because the metadata the
+/// download stage needs (file name, url, sha1, size) lives in the version and
+/// not in `mod_cache`.
+///
+/// Two sets fall back to the normal resolver: mod ids the map does not cover,
+/// and version ids the response omitted — Modrinth dropped the exact version
+/// the popup showed. Both are logged, because both mean the launch is not
+/// installing what the user was shown.
+pub(super) async fn resolve_preresolved_versions(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    selected_mods: &[SelectedMod],
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+    preresolved: &HashMap<String, String>,
+) -> Result<HashMap<String, ModrinthVersion>> {
+    let (covered, uncovered) = split_selected_by_preresolved(selected_mods, preresolved);
+
+    if !uncovered.is_empty() {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            format!(
+                "[Launch] the pre-check did not cover {}; resolving {} the usual way (the mod-list changed between the pre-check and the launch)",
+                uncovered.join(", "),
+                if uncovered.len() == 1 { "it" } else { "them" }
+            ),
+        );
+    }
+
+    let version_ids = covered
+        .iter()
+        .map(|(_, version_id)| version_id.clone())
+        .collect::<Vec<_>>();
+    let by_version_id = client.fetch_versions_by_ids(&version_ids).await?;
+    let resolved = versions_by_mod_id(&covered, &by_version_id);
+
+    let (fallback_mod_ids, dropped) = mod_ids_needing_resolution(&covered, &resolved, &uncovered);
+    if !dropped.is_empty() {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Launch] Modrinth no longer returns the pre-checked version of {}; resolving the usual way",
+                dropped.join(", ")
+            ),
+        );
+    }
+
+    let fallback = resolve_compatible_versions_hybrid(
+        app_handle,
+        launcher_paths,
+        http_client,
+        &selection_subset(selected_mods, &fallback_mod_ids),
+        client,
+        target,
+    )
+    .await?;
+
+    Ok(merge_resolved_versions(resolved, fallback))
+}
+
 /// Resolve, drop what Modrinth has no compatible version for, re-resolve, and
 /// collect what the target loads.
 ///
@@ -652,6 +792,12 @@ pub(super) fn reresolve_without_unavailable(
 /// feature to let drift apart. The version map of this pass is thrown away here
 /// as it always was — only `unavailable` is used — because the authoritative
 /// set is the one after the re-resolution.
+///
+/// `preresolved` short-circuits the availability question for the mods it
+/// covers: the pre-check already established they have a version, so asking
+/// again would both cost requests and let the two answers disagree. Mods it
+/// does not cover still go through the resolver, so a mod-list that grew after
+/// the pre-check is not silently disabled.
 pub(super) async fn resolve_online_selection(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
@@ -659,20 +805,30 @@ pub(super) async fn resolve_online_selection(
     modlist: &ModList,
     client: &ModrinthClient,
     target: &ResolutionTarget,
+    preresolved: Option<&HashMap<String, String>>,
 ) -> Result<TargetSelection> {
     let resolution = resolve_modlist(modlist, target)?;
     let selected = collect_selected_mods(modlist, &resolution, target);
+    let to_query = match preresolved {
+        Some(preresolved) => {
+            let (_, uncovered) = split_selected_by_preresolved(&selected, preresolved);
+            selection_subset(&selected, &uncovered)
+        }
+        None => selected.clone(),
+    };
     let versions = resolve_compatible_versions_hybrid(
         app_handle,
         launcher_paths,
         http_client,
-        &selected,
+        &to_query,
         client,
         target,
     )
     .await?;
-    let unavailable =
-        unavailable_selected_mods(&selected, |mod_id| versions.contains_key(mod_id));
+    let unavailable = unavailable_selected_mods(&selected, |mod_id| {
+        versions.contains_key(mod_id)
+            || preresolved.is_some_and(|preresolved| preresolved.contains_key(mod_id))
+    });
     let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
     let selected_mods = collect_selected_mods(modlist, &resolution, target);
 
@@ -1044,5 +1200,93 @@ mod tests {
         assert_eq!(merged.get("sodium"), Some(&from_bulk));
         assert_eq!(merged.get("polytone"), Some(&from_per_project));
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn a_full_version_map_sends_no_mod_to_the_resolver() {
+        let selected = vec![modrinth_mod("sodium"), modrinth_mod("lithium")];
+        let preresolved = HashMap::from([
+            ("sodium".to_string(), "sodium-v2".to_string()),
+            ("lithium".to_string(), "lithium-v7".to_string()),
+        ]);
+
+        let (covered, uncovered) = split_selected_by_preresolved(&selected, &preresolved);
+
+        assert_eq!(
+            covered,
+            vec![
+                ("sodium".to_string(), "sodium-v2".to_string()),
+                ("lithium".to_string(), "lithium-v7".to_string()),
+            ]
+        );
+        assert!(uncovered.is_empty());
+    }
+
+    #[test]
+    fn a_mod_added_after_the_precheck_is_resolved_as_usual() {
+        let selected = vec![
+            modrinth_mod("sodium"),
+            modrinth_mod("polytone"),
+            local_mod("optifine"),
+            modrinth_mod("sodium"),
+        ];
+        let preresolved = HashMap::from([("sodium".to_string(), "sodium-v2".to_string())]);
+
+        let (covered, uncovered) = split_selected_by_preresolved(&selected, &preresolved);
+
+        // Local mods never take part, and a repeated mod id yields one entry.
+        assert_eq!(
+            covered,
+            vec![("sodium".to_string(), "sodium-v2".to_string())]
+        );
+        assert_eq!(uncovered, vec!["polytone".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_version_map_sends_every_mod_to_the_resolver() {
+        let selected = vec![modrinth_mod("sodium"), modrinth_mod("lithium")];
+
+        let (covered, uncovered) = split_selected_by_preresolved(&selected, &HashMap::new());
+
+        assert!(covered.is_empty());
+        assert_eq!(
+            uncovered,
+            vec!["sodium".to_string(), "lithium".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_prechecked_version_modrinth_dropped_falls_back_to_the_resolver() {
+        let covered = vec![
+            ("sodium".to_string(), "sodium-v2".to_string()),
+            ("lithium".to_string(), "lithium-v7".to_string()),
+        ];
+        let resolved = HashMap::from([(
+            "sodium".to_string(),
+            test_version("sodium-v2", "2026-01-01T00:00:00Z"),
+        )]);
+
+        let (all, dropped) = mod_ids_needing_resolution(
+            &covered,
+            &resolved,
+            &["polytone".to_string()],
+        );
+
+        assert_eq!(dropped, vec!["lithium".to_string()]);
+        assert_eq!(all, vec!["lithium".to_string(), "polytone".to_string()]);
+    }
+
+    #[test]
+    fn nothing_falls_back_when_every_prechecked_version_still_exists() {
+        let covered = vec![("sodium".to_string(), "sodium-v2".to_string())];
+        let resolved = HashMap::from([(
+            "sodium".to_string(),
+            test_version("sodium-v2", "2026-01-01T00:00:00Z"),
+        )]);
+
+        let (all, dropped) = mod_ids_needing_resolution(&covered, &resolved, &[]);
+
+        assert!(all.is_empty());
+        assert!(dropped.is_empty());
     }
 }

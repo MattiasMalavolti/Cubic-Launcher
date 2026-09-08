@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,16 @@ pub struct LaunchRequest {
     pub modlist_name: String,
     pub minecraft_version: String,
     pub mod_loader: String,
+    /// `mod_id → version_id`, decided upstream by the update pre-check.
+    ///
+    /// **Optional on purpose.** A request without it must behave exactly as it
+    /// did before this field existed, or every existing caller breaks —
+    /// `scripts/launch-harness/` included. When it is there, the pipeline uses
+    /// these versions instead of choosing again: a launch that re-picks can
+    /// change its mind between the popup and Play, which is the silent drift
+    /// this feature exists to close (D16).
+    #[serde(default)]
+    pub resolved_versions: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -20,6 +31,10 @@ pub struct LaunchVerificationRequest {
     pub modlist_name: String,
     pub minecraft_version: String,
     pub mod_loader: String,
+    /// Forwarded to the launch untouched, so an automated run can exercise the
+    /// pre-resolved path end to end.
+    #[serde(default)]
+    pub resolved_versions: Option<HashMap<String, String>>,
     #[serde(default = "default_verification_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_success_after_seconds")]
@@ -125,6 +140,7 @@ impl LaunchVerificationRequest {
             modlist_name: self.modlist_name,
             minecraft_version: self.minecraft_version,
             mod_loader: self.mod_loader,
+            resolved_versions: self.resolved_versions,
         }
     }
 }

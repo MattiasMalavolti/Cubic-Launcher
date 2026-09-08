@@ -275,6 +275,13 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     // Both branches live in `launch_preview_artifacts.rs` because the update
     // pre-check runs the online one too: it has to name exactly the mods this
     // launch will install.
+    //
+    // An empty map counts as absent: it carries no decision, and treating it as
+    // one would disable every mod.
+    let preresolved_versions = request
+        .resolved_versions
+        .as_ref()
+        .filter(|versions| !versions.is_empty());
     let selection = if effective_settings.cache_only_mode {
         resolve_cache_only_selection(&launcher_paths, &modlist, &target).await?
     } else {
@@ -285,6 +292,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             &modlist,
             &modrinth_client,
             &target,
+            preresolved_versions,
         )
         .await?
     };
@@ -350,23 +358,43 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             Vec::new(),
         )
     } else {
-        // DESIGN: deliberately a second hybrid pass, not a reuse of the one
-        // inside `resolve_online_selection`. That one ran on the mods the
-        // first resolution selected; this one runs on `selected_mods`, which
-        // exists only after the re-resolution and can contain alternatives the
-        // first pass never saw. Merging the two means handling that delta, and
+        // DESIGN: deliberately a second pass, not a reuse of the one inside
+        // `resolve_online_selection`. That one ran on the mods the first
+        // resolution selected; this one runs on `selected_mods`, which exists
+        // only after the re-resolution and can contain alternatives the first
+        // pass never saw. Merging the two means handling that delta, and
         // getting it wrong means a mod the re-resolution enabled that nobody
-        // looks up. Two hybrid passes still cost ~10 requests against the 52
-        // of one request per mod per pass.
-        let compatible_versions = resolve_compatible_versions_hybrid(
-            &app_handle,
-            &launcher_paths,
-            &http_client,
-            &selected_mods,
-            &modrinth_client,
-            &target,
-        )
-        .await?;
+        // looks up. Two passes still cost ~10 requests against the 52 of one
+        // request per mod per pass.
+        //
+        // With a version map from the pre-check this pass stops choosing and
+        // starts looking up: the launch installs exactly what the popup showed
+        // (D16).
+        let compatible_versions = match preresolved_versions {
+            Some(preresolved) => {
+                resolve_preresolved_versions(
+                    &app_handle,
+                    &launcher_paths,
+                    &http_client,
+                    &selected_mods,
+                    &modrinth_client,
+                    &target,
+                    preresolved,
+                )
+                .await?
+            }
+            None => {
+                resolve_compatible_versions_hybrid(
+                    &app_handle,
+                    &launcher_paths,
+                    &http_client,
+                    &selected_mods,
+                    &modrinth_client,
+                    &target,
+                )
+                .await?
+            }
+        };
         let parent_versions = selected_mods
             .iter()
             .filter(|selected| matches!(selected.source, ModSource::Modrinth))

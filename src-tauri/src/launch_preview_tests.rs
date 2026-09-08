@@ -18,7 +18,8 @@ use super::{
     relative_loader_library_path, substitute_known_placeholders, validate_content_filename,
     validate_final_fabric_runtime, DependencyNoticeKind, EffectiveLaunchSettings,
     EmbeddedFabricModMetadata, EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
-    FabricValidationIssue, LaunchPlaceholders, LaunchVerificationRequest, LaunchVerificationResult,
+    FabricValidationIssue, LaunchPlaceholders, LaunchRequest, LaunchVerificationRequest,
+    LaunchVerificationResult,
     OwnedEmbeddedFabricModMetadata, PlayerIdentity,
 };
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
@@ -862,6 +863,7 @@ fn automation_env_does_not_silently_drop_fields() {
         modlist_name: "Pack".into(),
         minecraft_version: "1.20.1".into(),
         mod_loader: "neoforge".into(),
+        resolved_versions: Some(HashMap::from([("sodium".to_string(), "abc123".to_string())])),
         timeout_seconds: 30,
         success_after_seconds: 10,
         terminate_on_success: true,
@@ -872,6 +874,37 @@ fn automation_env_does_not_silently_drop_fields() {
     assert_eq!(back, request);
     assert_eq!(back.success_after_seconds, 10);
     assert!(!back.terminate_on_timeout);
+    // The version map has to survive `into_launch_request` too, or an automated
+    // run could never exercise the pre-resolved path.
+    assert_eq!(
+        back.into_launch_request().resolved_versions,
+        Some(HashMap::from([("sodium".to_string(), "abc123".to_string())]))
+    );
+}
+
+#[test]
+fn a_launch_request_without_a_version_map_is_the_request_of_today() {
+    // Every existing caller — the frontend and `scripts/launch-harness/` —
+    // sends these three fields and nothing else. The pipeline branches on
+    // `resolved_versions` being absent, so an accidental `#[serde(deny_...)]`
+    // or a non-optional field would break all of them at once.
+    let request: LaunchRequest = serde_json::from_str(
+        r#"{"modlistName":"Pack","minecraftVersion":"1.20.1","modLoader":"forge"}"#,
+    )
+    .expect("today's request must still deserialize");
+
+    assert_eq!(request.resolved_versions, None);
+
+    let with_map: LaunchRequest = serde_json::from_str(
+        r#"{"modlistName":"Pack","minecraftVersion":"1.20.1","modLoader":"forge",
+             "resolvedVersions":{"sodium":"abc123"}}"#,
+    )
+    .expect("a request carrying the map must deserialize");
+
+    assert_eq!(
+        with_map.resolved_versions,
+        Some(HashMap::from([("sodium".to_string(), "abc123".to_string())]))
+    );
 }
 
 // ── Informational dependency detection (no auto-management) ──────────────────

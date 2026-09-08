@@ -237,6 +237,8 @@ pub(super) async fn run_update_precheck(
         &modlist,
         &modrinth_client,
         &target,
+        // The pre-check is the thing that decides: it has nothing handed down.
+        None,
     )
     .await?;
 
@@ -632,6 +634,41 @@ mod tests {
         assert_eq!(
             version_ids_needing_a_number(&cached, &candidates),
             vec!["sodium-v1".to_string()]
+        );
+    }
+
+    #[test]
+    fn serializes_the_exact_payload_contract_the_frontend_reads() {
+        // A2 builds the popup against these names. Nothing else in this crate
+        // reads them back, so a rename would otherwise only show up as an
+        // empty popup at runtime.
+        let result = UpdatePrecheckResult {
+            updates: vec![ModUpdateRow {
+                mod_id: "sodium".into(),
+                project_id: "AANobbMI".into(),
+                current_version_id: "sodium-v1".into(),
+                current_version_number: None,
+                candidate_version_id: "sodium-v2".into(),
+                candidate_version_number: "0.6.0".into(),
+            }],
+            resolved: string_map(&[("sodium", "sodium-v2")]),
+            version_number_lookup_error: Some("boom".into()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&result).expect("payload should serialize"),
+            serde_json::json!({
+                "updates": [{
+                    "modId": "sodium",
+                    "projectId": "AANobbMI",
+                    "currentVersionId": "sodium-v1",
+                    "currentVersionNumber": null,
+                    "candidateVersionId": "sodium-v2",
+                    "candidateVersionNumber": "0.6.0",
+                }],
+                "resolved": { "sodium": "sodium-v2" },
+                "versionNumberLookupError": "boom",
+            })
         );
     }
 }
