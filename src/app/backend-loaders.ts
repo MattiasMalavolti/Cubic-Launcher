@@ -425,3 +425,12 @@ export function seedModName(id: string, name: string) {
   modNameCache.set(id, name);
   patchModNames();
 }
+
+/**
+ * The readable name `fetchModMetadata` cached for a Modrinth project id, for
+ * callers that hold an id and no `ModRow` — the update popup's rows name a
+ * `projectId` and nothing else.
+ */
+export function cachedModName(id: string): string | undefined {
+  return modNameCache.get(id);
+}

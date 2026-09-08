@@ -177,6 +177,28 @@ export type ProcessExitEvent = {
   exitCode?: number | null;
 };
 
+/** One row of `update_precheck_command`'s `updates` (`launch_preview_precheck.rs:40-58`). */
+export type ModUpdateRow = {
+  /** The mod actually loaded for this target — the alternative, when a group resolved through one (D9). */
+  modId: string;
+  /** Canonical Modrinth project id: the key for `modIcons()` and the name cache. */
+  projectId: string;
+  currentVersionId: string;
+  /** `null` when Modrinth no longer returns the registered version, or when the number lookup failed (D24). */
+  currentVersionNumber: string | null;
+  candidateVersionId: string;
+  candidateVersionNumber: string;
+};
+
+/** `update_precheck_command`'s payload (`launch_preview_precheck.rs:62-83`). */
+export type UpdatePrecheckResult = {
+  updates: ModUpdateRow[];
+  /** `mod_id → version_id` for every selected Modrinth mod, updated or not (D16, D17). */
+  resolved: Record<string, string>;
+  /** Set when the version-number lookup failed; costs the "from" labels and nothing else. */
+  versionNumberLookupError: string | null;
+};
+
 // ── Static constants ──────────────────────────────────────────────────────────
 
 export const MOD_LOADERS = ["Fabric", "NeoForge", "Forge", "Vanilla"] as const;
