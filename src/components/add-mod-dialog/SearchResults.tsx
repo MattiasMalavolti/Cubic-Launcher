@@ -4,6 +4,37 @@ import type { ModrinthResult } from "../../lib/types";
 import { SearchIcon, XIcon, PackageIcon, CheckIcon, Loader2Icon } from "../icons";
 import { formatDownloads } from "./shared";
 
+function PaginationControls(props: {
+  totalPages: number;
+  page: number;
+  previousPage: () => void;
+  nextPage: () => void;
+}) {
+  return (
+    <Show when={props.totalPages > 1}>
+      <div class="flex items-center justify-center gap-3 pt-3 pb-1">
+        <button
+          onClick={props.previousPage}
+          disabled={props.page === 0}
+          class="rounded-md border border-border px-3 py-1 text-xs text-foreground hover:bg-muted disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+        >
+          Previous
+        </button>
+        <span class="text-xs text-muted-foreground">
+          Page {props.page + 1} of {props.totalPages}
+        </span>
+        <button
+          onClick={props.nextPage}
+          disabled={props.page >= props.totalPages - 1}
+          class="rounded-md border border-border px-3 py-1 text-xs text-foreground hover:bg-muted disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+        >
+          Next
+        </button>
+      </div>
+    </Show>
+  );
+}
+
 export function SearchResults(props: {
   contentType: "mod" | "resourcepack" | "datapack" | "shader";
   searching: boolean;
@@ -22,9 +53,6 @@ export function SearchResults(props: {
     <div class="flex-1 min-h-0 overflow-y-auto p-4">
       <div class="relative mb-3">
         <SearchIcon class="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-        <Show when={props.searching}>
-          <Loader2Icon class="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted-foreground" />
-        </Show>
         <Show when={addModSearch()}>
           <button
             onClick={() => props.setSearch("")}
@@ -43,13 +71,13 @@ export function SearchResults(props: {
         />
       </div>
 
-      <Show when={!addModSearch() && !props.searching}>
-        <p class="mb-3 text-xs text-muted-foreground">
-          {props.contentType === "mod" ? "Popular mods" : props.contentType === "resourcepack" ? "Popular resource packs" : props.contentType === "datapack" ? "Popular data packs" : "Popular shaders"} on Modrinth
-        </p>
-      </Show>
-
       <div class="space-y-1.5">
+        <PaginationControls
+          totalPages={props.totalPages}
+          page={props.page}
+          previousPage={props.previousPage}
+          nextPage={props.nextPage}
+        />
         <For each={props.searchResults}>
           {mod => {
             const isAdded = () => props.addedIds.has(mod.id) || props.existingIds.has(mod.id);
@@ -119,27 +147,12 @@ export function SearchResults(props: {
           </div>
         </Show>
 
-        <Show when={props.totalPages > 1}>
-          <div class="flex items-center justify-center gap-3 pt-3 pb-1">
-            <button
-              onClick={props.previousPage}
-              disabled={props.page === 0}
-              class="rounded-md border border-border px-3 py-1 text-xs text-foreground hover:bg-muted disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-            >
-              Previous
-            </button>
-            <span class="text-xs text-muted-foreground">
-              Page {props.page + 1} of {props.totalPages}
-            </span>
-            <button
-              onClick={props.nextPage}
-              disabled={props.page >= props.totalPages - 1}
-              class="rounded-md border border-border px-3 py-1 text-xs text-foreground hover:bg-muted disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-            >
-              Next
-            </button>
-          </div>
-        </Show>
+        <PaginationControls
+          totalPages={props.totalPages}
+          page={props.page}
+          previousPage={props.previousPage}
+          nextPage={props.nextPage}
+        />
       </div>
     </div>
   );
