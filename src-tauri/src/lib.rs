@@ -119,6 +119,7 @@ pub fn run() {
             content_packs::save_content_groups_command,
             content_packs::save_content_version_rules_command,
             launch_preview::start_launch_command,
+            launch_preview::update_precheck_command,
             launch_preview::verify_launch_command,
             launch_preview::stop_minecraft_command,
             updater::check_for_updates,

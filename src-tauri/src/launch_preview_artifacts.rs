@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -11,14 +12,15 @@ use crate::mod_cache::ModCacheRecord;
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{
-    version_rules_conflict, FailureReason, ModLoader, ResolutionResult, ResolutionTarget,
-    RuleOutcome,
+    resolve_modlist, version_rules_conflict, FailureReason, ModLoader, ResolutionResult,
+    ResolutionTarget, RuleOutcome,
 };
 use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
 
 use super::{
     embedded_minecraft_requirements_match, emit_log, ensure_remote_version_cached,
-    load_cached_mod_record_for_target, read_embedded_fabric_requirements, SelectedMod,
+    load_cached_file_hashes_for_selected, load_cached_mod_record_for_target,
+    read_embedded_fabric_requirements, SelectedMod,
 };
 
 pub(super) struct TopLevelVersionCandidates {
@@ -141,6 +143,230 @@ pub(super) async fn prefetch_compatible_versions_for_selected(
     }
 
     Ok(versions)
+}
+
+/// Selected Modrinth mods split by whether `mod_cache` knows a sha1 for them on
+/// this target. One entry per mod id, in resolution order.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct CachedHashSplit {
+    /// `(mod_id, lowercased sha1)` — the bulk path.
+    pub(super) hashed: Vec<(String, String)>,
+    /// No row for this target, or a row whose `file_hash` is NULL — the
+    /// per-project path.
+    pub(super) unhashed: Vec<String>,
+}
+
+/// What the bulk stage answered, and what it left to the per-project stage.
+pub(super) struct HashStageOutcome {
+    pub(super) resolved: HashMap<String, ModrinthVersion>,
+    pub(super) per_project_mod_ids: Vec<String>,
+    /// Mod ids that had a cached hash the bulk response omitted, and are
+    /// therefore retried per project (D22). Subset of `per_project_mod_ids`.
+    pub(super) omitted_mod_ids: Vec<String>,
+    /// Set when the bulk call itself failed and its whole set fell back.
+    pub(super) bulk_error: Option<String>,
+}
+
+pub(super) fn split_selected_by_cached_hash(
+    selected_mods: &[SelectedMod],
+    hash_by_mod_id: &HashMap<String, String>,
+) -> CachedHashSplit {
+    let mut split = CachedHashSplit::default();
+    let mut seen = HashSet::new();
+
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth) {
+            continue;
+        }
+        if !seen.insert(selected.mod_id.as_str()) {
+            continue;
+        }
+
+        match hash_by_mod_id.get(&selected.mod_id) {
+            Some(hash) => split.hashed.push((selected.mod_id.clone(), hash.clone())),
+            None => split.unhashed.push(selected.mod_id.clone()),
+        }
+    }
+
+    split
+}
+
+/// Re-key a keyed Modrinth response by mod id, dropping the mod ids the
+/// response left out.
+///
+/// Used with two kinds of key. A **sha1** from the bulk endpoint: an omitted
+/// hash yields no entry and the caller retries that mod per project instead of
+/// declaring it unavailable, because the response cannot distinguish "no
+/// version for this target" from "this hash is no longer known". A **version
+/// id** handed down by the pre-check: an omission there means Modrinth dropped
+/// the exact version the popup showed. Two mod ids sharing one key both
+/// resolve either way.
+pub(super) fn versions_by_mod_id(
+    keyed: &[(String, String)],
+    versions_by_key: &HashMap<String, ModrinthVersion>,
+) -> HashMap<String, ModrinthVersion> {
+    keyed
+        .iter()
+        .filter_map(|(mod_id, key)| {
+            versions_by_key
+                .get(key)
+                .map(|version| (mod_id.clone(), version.clone()))
+        })
+        .collect()
+}
+
+/// Bulk results win; the per-project stage only fills mod ids the bulk stage
+/// left out. The two key sets are disjoint in the normal path and overlap only
+/// after a failed bulk call sent its whole set to the fallback.
+pub(super) fn merge_resolved_versions(
+    mut bulk: HashMap<String, ModrinthVersion>,
+    per_project: HashMap<String, ModrinthVersion>,
+) -> HashMap<String, ModrinthVersion> {
+    for (mod_id, version) in per_project {
+        bulk.entry(mod_id).or_insert(version);
+    }
+    bulk
+}
+
+/// The bulk stage: one cascade for every mod that has a cached hash.
+///
+/// Generic over the request so both fallbacks are testable without network.
+///
+/// Two things go back to the per-project path. An **omitted hash** (D22): the
+/// endpoint answers `200` with the hash simply absent, and that covers both "no
+/// version exists for this target" — where the per-project path finds nothing
+/// either, so the retry costs one wasted request — and "Modrinth no longer
+/// knows this hash", where the per-project path still finds the version and the
+/// mod keeps working exactly as it does today. A **failed call**: a per-project
+/// error costs one mod today (`prefetch_compatible_versions_for_selected`),
+/// while a bulk error would cost the whole modlist, so the set falls back
+/// instead of shrinking the launch. Both are slow paths, and both are rare.
+pub(super) async fn resolve_versions_for_cached_hashes<Fetch, Fut>(
+    split: &CachedHashSplit,
+    fetch_bulk: Fetch,
+) -> HashStageOutcome
+where
+    Fetch: FnOnce(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<HashMap<String, ModrinthVersion>>>,
+{
+    if split.hashed.is_empty() {
+        return HashStageOutcome {
+            resolved: HashMap::new(),
+            per_project_mod_ids: split.unhashed.clone(),
+            omitted_mod_ids: Vec::new(),
+            bulk_error: None,
+        };
+    }
+
+    let hashes = split
+        .hashed
+        .iter()
+        .map(|(_, hash)| hash.clone())
+        .collect::<Vec<_>>();
+
+    match fetch_bulk(hashes).await {
+        Ok(versions_by_hash) => {
+            let resolved = versions_by_mod_id(&split.hashed, &versions_by_hash);
+            let omitted_mod_ids = split
+                .hashed
+                .iter()
+                .map(|(mod_id, _)| mod_id)
+                .filter(|mod_id| !resolved.contains_key(mod_id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let mut per_project_mod_ids = omitted_mod_ids.clone();
+            per_project_mod_ids.extend(split.unhashed.iter().cloned());
+
+            HashStageOutcome {
+                resolved,
+                per_project_mod_ids,
+                omitted_mod_ids,
+                bulk_error: None,
+            }
+        }
+        Err(error) => {
+            let mut per_project_mod_ids = split
+                .hashed
+                .iter()
+                .map(|(mod_id, _)| mod_id.clone())
+                .collect::<Vec<_>>();
+            per_project_mod_ids.extend(split.unhashed.iter().cloned());
+
+            HashStageOutcome {
+                resolved: HashMap::new(),
+                per_project_mod_ids,
+                omitted_mod_ids: Vec::new(),
+                bulk_error: Some(format!("{error:#}")),
+            }
+        }
+    }
+}
+
+/// Same contract as `prefetch_compatible_versions_for_selected` — mod id →
+/// preferred `ModrinthVersion` — reached through `mod_cache` + the bulk
+/// endpoint, falling back to one request per mod only for the mods no cached
+/// hash covers.
+pub(super) async fn resolve_compatible_versions_hybrid(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    selected_mods: &[SelectedMod],
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+) -> Result<HashMap<String, ModrinthVersion>> {
+    let hash_by_mod_id =
+        load_cached_file_hashes_for_selected(launcher_paths, selected_mods, target)?;
+    let split = split_selected_by_cached_hash(selected_mods, &hash_by_mod_id);
+    let outcome = resolve_versions_for_cached_hashes(&split, |hashes| async move {
+        client.fetch_latest_versions_by_hash(&hashes, target).await
+    })
+    .await;
+
+    if let Some(error) = &outcome.bulk_error {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Launch] bulk version lookup failed for {} cached hashes; falling back to one request per mod ({error})",
+                split.hashed.len()
+            ),
+        );
+    } else if !outcome.omitted_mod_ids.is_empty() {
+        // The endpoint reports neither "unknown hash" nor "no version for this
+        // target": both are omissions. Naming them is the only diagnostic
+        // available for a case that should not happen (D23).
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Launch] bulk version lookup omitted {}; retrying one request per mod",
+                outcome.omitted_mod_ids.join(", ")
+            ),
+        );
+    }
+
+    let per_project_mod_ids = outcome
+        .per_project_mod_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let per_project_selection = selected_mods
+        .iter()
+        .filter(|selected| per_project_mod_ids.contains(selected.mod_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let per_project = prefetch_compatible_versions_for_selected(
+        app_handle,
+        launcher_paths,
+        http_client,
+        &per_project_selection,
+        client,
+        target,
+    )
+    .await?;
+
+    Ok(merge_resolved_versions(outcome.resolved, per_project))
 }
 
 pub(super) async fn prefetch_ranked_versions_for_selected(
@@ -373,6 +599,268 @@ pub(super) async fn resolve_selected_remote_artifacts(
     Ok(artifacts)
 }
 
+/// What a target actually loads, once the availability pass has had its say.
+#[derive(Debug, Clone)]
+pub(super) struct TargetSelection {
+    pub(super) resolution: ResolutionResult,
+    pub(super) selected_mods: Vec<SelectedMod>,
+}
+
+/// The Modrinth mods resolution selected and for which no artifact is
+/// available. `is_available` is the only difference between the online and the
+/// cache-only reading of "available", so the rest is shared.
+pub(super) fn unavailable_selected_mods<Available>(
+    selected_mods: &[SelectedMod],
+    is_available: Available,
+) -> Vec<String>
+where
+    Available: Fn(&str) -> bool,
+{
+    selected_mods
+        .iter()
+        .filter(|selected| matches!(selected.source, ModSource::Modrinth))
+        .filter(|selected| !is_available(&selected.mod_id))
+        .map(|selected| selected.mod_id.clone())
+        .collect()
+}
+
+/// Temporarily disable the mods with no available artifact and re-resolve, so
+/// alternatives get a chance. Nothing unavailable means the first resolution
+/// stands and no second resolution happens — the normal case.
+pub(super) fn reresolve_without_unavailable(
+    modlist: &ModList,
+    resolution: ResolutionResult,
+    unavailable: &[String],
+    target: &ResolutionTarget,
+) -> Result<ResolutionResult> {
+    if unavailable.is_empty() {
+        return Ok(resolution);
+    }
+
+    let mut patched = modlist.clone();
+    for mod_id in unavailable {
+        if let Some(rule) = patched.find_rule_mut(mod_id) {
+            rule.enabled = false;
+        }
+    }
+
+    resolve_modlist(&patched, target)
+}
+
+/// Selected Modrinth mods split by whether the pre-check already chose a
+/// version for them.
+///
+/// `covered` is `(mod_id, version_id)`, one entry per mod id, in resolution
+/// order — the same shape `versions_by_mod_id` consumes. `uncovered` is
+/// everything else: mods the pre-check never saw, which means the mod-list
+/// changed between the pre-check and the launch. That is a real case, not an
+/// error, and those mods are resolved the usual way.
+pub(super) fn split_selected_by_preresolved(
+    selected_mods: &[SelectedMod],
+    preresolved: &HashMap<String, String>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut covered = Vec::new();
+    let mut uncovered = Vec::new();
+    let mut seen = HashSet::new();
+
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth) {
+            continue;
+        }
+        if !seen.insert(selected.mod_id.as_str()) {
+            continue;
+        }
+
+        match preresolved.get(&selected.mod_id) {
+            Some(version_id) => covered.push((selected.mod_id.clone(), version_id.clone())),
+            None => uncovered.push(selected.mod_id.clone()),
+        }
+    }
+
+    (covered, uncovered)
+}
+
+fn selection_subset(selected_mods: &[SelectedMod], mod_ids: &[String]) -> Vec<SelectedMod> {
+    let wanted = mod_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+
+    selected_mods
+        .iter()
+        .filter(|selected| wanted.contains(selected.mod_id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The mod ids the normal resolver still has to answer for, in the order they
+/// will be logged: first the pre-checked versions Modrinth no longer returns,
+/// then the mods the pre-check never covered.
+///
+/// The first group is the one that matters and the one nobody would think of:
+/// the popup showed a version, the user agreed to it, and it is gone. Falling
+/// back keeps the mod in the launch instead of dropping it silently.
+pub(super) fn mod_ids_needing_resolution(
+    covered: &[(String, String)],
+    resolved: &HashMap<String, ModrinthVersion>,
+    uncovered: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let dropped = covered
+        .iter()
+        .map(|(mod_id, _)| mod_id)
+        .filter(|mod_id| !resolved.contains_key(mod_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut all = dropped.clone();
+    all.extend(uncovered.iter().cloned());
+
+    (all, dropped)
+}
+
+/// The versions the launch will install, taken from the ids the pre-check
+/// already chose (D16) instead of choosing again.
+///
+/// `GET /versions?ids=` fetches those exact versions in one request — it is a
+/// lookup, not a selection, so nothing here can pick a different version than
+/// the popup showed. Modrinth still has to be asked because the metadata the
+/// download stage needs (file name, url, sha1, size) lives in the version and
+/// not in `mod_cache`.
+///
+/// Two sets fall back to the normal resolver: mod ids the map does not cover,
+/// and version ids the response omitted — Modrinth dropped the exact version
+/// the popup showed. Both are logged, because both mean the launch is not
+/// installing what the user was shown.
+pub(super) async fn resolve_preresolved_versions(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    selected_mods: &[SelectedMod],
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+    preresolved: &HashMap<String, String>,
+) -> Result<HashMap<String, ModrinthVersion>> {
+    let (covered, uncovered) = split_selected_by_preresolved(selected_mods, preresolved);
+
+    if !uncovered.is_empty() {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            format!(
+                "[Launch] the pre-check did not cover {}; resolving {} the usual way (the mod-list changed between the pre-check and the launch)",
+                uncovered.join(", "),
+                if uncovered.len() == 1 { "it" } else { "them" }
+            ),
+        );
+    }
+
+    let version_ids = covered
+        .iter()
+        .map(|(_, version_id)| version_id.clone())
+        .collect::<Vec<_>>();
+    let by_version_id = client.fetch_versions_by_ids(&version_ids).await?;
+    let resolved = versions_by_mod_id(&covered, &by_version_id);
+
+    let (fallback_mod_ids, dropped) = mod_ids_needing_resolution(&covered, &resolved, &uncovered);
+    if !dropped.is_empty() {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Launch] Modrinth no longer returns the pre-checked version of {}; resolving the usual way",
+                dropped.join(", ")
+            ),
+        );
+    }
+
+    let fallback = resolve_compatible_versions_hybrid(
+        app_handle,
+        launcher_paths,
+        http_client,
+        &selection_subset(selected_mods, &fallback_mod_ids),
+        client,
+        target,
+    )
+    .await?;
+
+    Ok(merge_resolved_versions(resolved, fallback))
+}
+
+/// Resolve, drop what Modrinth has no compatible version for, re-resolve, and
+/// collect what the target loads.
+///
+/// Shared between `run_launch_pipeline` and the update pre-check on purpose:
+/// the pre-check exists to show exactly what the launch will install, and two
+/// copies of "which mods does this target load" are the easiest thing in this
+/// feature to let drift apart. The version map of this pass is thrown away here
+/// as it always was — only `unavailable` is used — because the authoritative
+/// set is the one after the re-resolution.
+///
+/// `preresolved` short-circuits the availability question for the mods it
+/// covers: the pre-check already established they have a version, so asking
+/// again would both cost requests and let the two answers disagree. Mods it
+/// does not cover still go through the resolver, so a mod-list that grew after
+/// the pre-check is not silently disabled.
+pub(super) async fn resolve_online_selection(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    modlist: &ModList,
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+    preresolved: Option<&HashMap<String, String>>,
+) -> Result<TargetSelection> {
+    let resolution = resolve_modlist(modlist, target)?;
+    let selected = collect_selected_mods(modlist, &resolution, target);
+    let to_query = match preresolved {
+        Some(preresolved) => {
+            let (_, uncovered) = split_selected_by_preresolved(&selected, preresolved);
+            selection_subset(&selected, &uncovered)
+        }
+        None => selected.clone(),
+    };
+    let versions = resolve_compatible_versions_hybrid(
+        app_handle,
+        launcher_paths,
+        http_client,
+        &to_query,
+        client,
+        target,
+    )
+    .await?;
+    let unavailable = unavailable_selected_mods(&selected, |mod_id| {
+        versions.contains_key(mod_id)
+            || preresolved.is_some_and(|preresolved| preresolved.contains_key(mod_id))
+    });
+    let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
+    let selected_mods = collect_selected_mods(modlist, &resolution, target);
+
+    Ok(TargetSelection {
+        resolution,
+        selected_mods,
+    })
+}
+
+/// Same as `resolve_online_selection`, with a valid cached artifact counting as
+/// available and no network at all.
+pub(super) async fn resolve_cache_only_selection(
+    launcher_paths: &LauncherPaths,
+    modlist: &ModList,
+    target: &ResolutionTarget,
+) -> Result<TargetSelection> {
+    let resolution = resolve_modlist(modlist, target)?;
+    let selected = collect_selected_mods(modlist, &resolution, target);
+    let available_artifacts =
+        resolve_selected_remote_artifacts(launcher_paths, &selected, target).await?;
+    let unavailable = unavailable_selected_mods(&selected, |mod_id| {
+        available_artifacts.contains_key(mod_id)
+    });
+    let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
+    let selected_mods = collect_selected_mods(modlist, &resolution, target);
+
+    Ok(TargetSelection {
+        resolution,
+        selected_mods,
+    })
+}
+
 pub(super) fn alt_viable_for_launch(
     rule: &Rule,
     active_mods: &HashSet<String>,
@@ -527,5 +1015,278 @@ mod tests {
 
         assert_eq!(first, Some(june.clone()));
         assert_eq!(second, Some(june));
+    }
+
+    fn modrinth_mod(mod_id: &str) -> SelectedMod {
+        SelectedMod {
+            mod_id: mod_id.into(),
+            source: ModSource::Modrinth,
+        }
+    }
+
+    fn local_mod(mod_id: &str) -> SelectedMod {
+        SelectedMod {
+            mod_id: mod_id.into(),
+            source: ModSource::Local,
+        }
+    }
+
+    fn cached_hashes(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(mod_id, hash)| ((*mod_id).to_string(), (*hash).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn split_sends_every_mod_with_a_cached_hash_to_the_bulk_path() {
+        let selected = vec![modrinth_mod("sodium"), modrinth_mod("lithium")];
+        let split = split_selected_by_cached_hash(
+            &selected,
+            &cached_hashes(&[("sodium", "aaa1"), ("lithium", "bbb2")]),
+        );
+
+        assert_eq!(
+            split.hashed,
+            vec![
+                ("sodium".to_string(), "aaa1".to_string()),
+                ("lithium".to_string(), "bbb2".to_string()),
+            ]
+        );
+        assert!(split.unhashed.is_empty());
+    }
+
+    #[test]
+    fn split_sends_every_mod_to_the_per_project_path_without_cached_hashes() {
+        let selected = vec![modrinth_mod("polytone"), modrinth_mod("connector-extras")];
+        let split = split_selected_by_cached_hash(&selected, &HashMap::new());
+
+        assert!(split.hashed.is_empty());
+        assert_eq!(split.unhashed, vec!["polytone", "connector-extras"]);
+    }
+
+    #[test]
+    fn split_separates_mixed_coverage_and_ignores_local_and_repeated_mods() {
+        let selected = vec![
+            modrinth_mod("sodium"),
+            local_mod("my-own.jar"),
+            modrinth_mod("polytone"),
+            modrinth_mod("sodium"),
+        ];
+        let split =
+            split_selected_by_cached_hash(&selected, &cached_hashes(&[("sodium", "aaa1")]));
+
+        assert_eq!(split.hashed, vec![("sodium".to_string(), "aaa1".to_string())]);
+        assert_eq!(split.unhashed, vec!["polytone"]);
+    }
+
+    #[tokio::test]
+    async fn a_hash_omitted_by_the_bulk_response_is_retried_per_project() {
+        let selected = vec![
+            modrinth_mod("sodium"),
+            modrinth_mod("lithium"),
+            modrinth_mod("polytone"),
+        ];
+        let split = split_selected_by_cached_hash(
+            &selected,
+            &cached_hashes(&[("sodium", "aaa1"), ("lithium", "bbb2")]),
+        );
+
+        let outcome = resolve_versions_for_cached_hashes(&split, |_hashes| async {
+            Ok(HashMap::from([(
+                "aaa1".to_string(),
+                test_version("sodium-version", "2026-01-01T00:00:00Z"),
+            )]))
+        })
+        .await;
+
+        assert_eq!(outcome.resolved.len(), 1);
+        assert!(outcome.resolved.contains_key("sodium"));
+        // An omission cannot be told apart from "no version for this target",
+        // so the mod goes back on the per-project path instead of being
+        // declared unavailable — ahead of the mods that never had a hash.
+        assert_eq!(outcome.omitted_mod_ids, vec!["lithium"]);
+        assert_eq!(outcome.per_project_mod_ids, vec!["lithium", "polytone"]);
+        assert!(outcome.bulk_error.is_none());
+
+        // ...and it resolves when the per-project stage finds the version, the
+        // case where an unknown hash would otherwise silently drop a mod that
+        // works today.
+        let from_per_project = test_version("lithium-version", "2026-01-01T00:00:00Z");
+        let merged = merge_resolved_versions(
+            outcome.resolved,
+            HashMap::from([("lithium".to_string(), from_per_project.clone())]),
+        );
+        assert_eq!(merged.get("lithium"), Some(&from_per_project));
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn two_mod_ids_sharing_a_cached_hash_both_resolve() {
+        let selected = vec![modrinth_mod("sodium"), modrinth_mod("AANobbMI")];
+        let split = split_selected_by_cached_hash(
+            &selected,
+            &cached_hashes(&[("sodium", "aaa1"), ("AANobbMI", "aaa1")]),
+        );
+
+        let outcome = resolve_versions_for_cached_hashes(&split, |hashes| async move {
+            assert_eq!(hashes, vec!["aaa1".to_string(), "aaa1".to_string()]);
+            Ok(HashMap::from([(
+                "aaa1".to_string(),
+                test_version("sodium-version", "2026-01-01T00:00:00Z"),
+            )]))
+        })
+        .await;
+
+        assert_eq!(outcome.resolved.len(), 2);
+        assert_eq!(
+            outcome.resolved.get("sodium"),
+            outcome.resolved.get("AANobbMI")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_bulk_call_sends_its_whole_set_to_the_per_project_path() {
+        let selected = vec![
+            modrinth_mod("sodium"),
+            modrinth_mod("lithium"),
+            modrinth_mod("polytone"),
+        ];
+        let split = split_selected_by_cached_hash(
+            &selected,
+            &cached_hashes(&[("sodium", "aaa1"), ("lithium", "bbb2")]),
+        );
+
+        let outcome = resolve_versions_for_cached_hashes(&split, |_hashes| async {
+            Err(anyhow::anyhow!("connection reset"))
+        })
+        .await;
+
+        assert!(outcome.resolved.is_empty());
+        assert_eq!(
+            outcome.per_project_mod_ids,
+            vec!["sodium", "lithium", "polytone"]
+        );
+        assert_eq!(outcome.bulk_error.as_deref(), Some("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_bulk_set_costs_no_request() {
+        let selected = vec![modrinth_mod("polytone")];
+        let split = split_selected_by_cached_hash(&selected, &HashMap::new());
+
+        let outcome = resolve_versions_for_cached_hashes(&split, |_hashes| async {
+            panic!("the bulk endpoint must not be called without hashes");
+        })
+        .await;
+
+        assert!(outcome.resolved.is_empty());
+        assert_eq!(outcome.per_project_mod_ids, vec!["polytone"]);
+    }
+
+    #[test]
+    fn per_project_results_only_fill_mod_ids_the_bulk_left_out() {
+        let from_bulk = test_version("from-bulk", "2026-01-01T00:00:00Z");
+        let from_per_project = test_version("from-per-project", "2026-01-01T00:00:00Z");
+
+        let merged = merge_resolved_versions(
+            HashMap::from([("sodium".to_string(), from_bulk.clone())]),
+            HashMap::from([
+                ("sodium".to_string(), from_per_project.clone()),
+                ("polytone".to_string(), from_per_project.clone()),
+            ]),
+        );
+
+        assert_eq!(merged.get("sodium"), Some(&from_bulk));
+        assert_eq!(merged.get("polytone"), Some(&from_per_project));
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn a_full_version_map_sends_no_mod_to_the_resolver() {
+        let selected = vec![modrinth_mod("sodium"), modrinth_mod("lithium")];
+        let preresolved = HashMap::from([
+            ("sodium".to_string(), "sodium-v2".to_string()),
+            ("lithium".to_string(), "lithium-v7".to_string()),
+        ]);
+
+        let (covered, uncovered) = split_selected_by_preresolved(&selected, &preresolved);
+
+        assert_eq!(
+            covered,
+            vec![
+                ("sodium".to_string(), "sodium-v2".to_string()),
+                ("lithium".to_string(), "lithium-v7".to_string()),
+            ]
+        );
+        assert!(uncovered.is_empty());
+    }
+
+    #[test]
+    fn a_mod_added_after_the_precheck_is_resolved_as_usual() {
+        let selected = vec![
+            modrinth_mod("sodium"),
+            modrinth_mod("polytone"),
+            local_mod("optifine"),
+            modrinth_mod("sodium"),
+        ];
+        let preresolved = HashMap::from([("sodium".to_string(), "sodium-v2".to_string())]);
+
+        let (covered, uncovered) = split_selected_by_preresolved(&selected, &preresolved);
+
+        // Local mods never take part, and a repeated mod id yields one entry.
+        assert_eq!(
+            covered,
+            vec![("sodium".to_string(), "sodium-v2".to_string())]
+        );
+        assert_eq!(uncovered, vec!["polytone".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_version_map_sends_every_mod_to_the_resolver() {
+        let selected = vec![modrinth_mod("sodium"), modrinth_mod("lithium")];
+
+        let (covered, uncovered) = split_selected_by_preresolved(&selected, &HashMap::new());
+
+        assert!(covered.is_empty());
+        assert_eq!(
+            uncovered,
+            vec!["sodium".to_string(), "lithium".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_prechecked_version_modrinth_dropped_falls_back_to_the_resolver() {
+        let covered = vec![
+            ("sodium".to_string(), "sodium-v2".to_string()),
+            ("lithium".to_string(), "lithium-v7".to_string()),
+        ];
+        let resolved = HashMap::from([(
+            "sodium".to_string(),
+            test_version("sodium-v2", "2026-01-01T00:00:00Z"),
+        )]);
+
+        let (all, dropped) = mod_ids_needing_resolution(
+            &covered,
+            &resolved,
+            &["polytone".to_string()],
+        );
+
+        assert_eq!(dropped, vec!["lithium".to_string()]);
+        assert_eq!(all, vec!["lithium".to_string(), "polytone".to_string()]);
+    }
+
+    #[test]
+    fn nothing_falls_back_when_every_prechecked_version_still_exists() {
+        let covered = vec![("sodium".to_string(), "sodium-v2".to_string())];
+        let resolved = HashMap::from([(
+            "sodium".to_string(),
+            test_version("sodium-v2", "2026-01-01T00:00:00Z"),
+        )]);
+
+        let (all, dropped) = mod_ids_needing_resolution(&covered, &resolved, &[]);
+
+        assert!(all.is_empty());
+        assert!(dropped.is_empty());
     }
 }
