@@ -54,6 +54,41 @@ pub struct PendingDownload {
     pub file_size: u64,
 }
 
+/// What the cache holds for a project or a version on one target.
+///
+/// The distinction the `find_*` lookups cannot express: they answer `None`
+/// both when a mod was never cached and when its row is intact but the jar is
+/// gone, so the second case is indistinguishable from the first and the mod
+/// simply leaves the game.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheProbe {
+    /// A row whose jar is in the cache directory.
+    Ready(ModCacheRecord),
+    /// A row whose jar is gone, carrying the url and the hash needed to fetch
+    /// that exact version again — no API call required.
+    JarMissing(ModCacheRecord),
+    /// A row whose jar is gone and that nothing here can restore: a locally
+    /// copied jar has no Modrinth url, and neither has a row saved without one.
+    JarMissingUnrecoverable(ModCacheRecord),
+    /// No row for this target.
+    NotCached,
+}
+
+/// What a row whose jar is gone allows. Pure, so the two callers of the probes
+/// share one definition of "restorable".
+pub fn classify_missing_jar(record: ModCacheRecord) -> CacheProbe {
+    let restorable = record
+        .download_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty());
+
+    if record.is_local || !restorable {
+        CacheProbe::JarMissingUnrecoverable(record)
+    } else {
+        CacheProbe::JarMissing(record)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModAcquisitionPlan {
     pub cached: Vec<ModCacheRecord>,
@@ -110,6 +145,20 @@ pub fn cached_artifact_path_for_pending_download(
         &pending.modrinth_version_id,
         &pending.jar_filename,
     )
+}
+
+/// The eight `mod_cache` columns in the order every record query selects them.
+fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModCacheRecord> {
+    Ok(ModCacheRecord {
+        modrinth_project_id: row.get(0)?,
+        modrinth_version_id: row.get(1)?,
+        jar_filename: row.get(2)?,
+        mc_version: row.get(3)?,
+        mod_loader: row.get(4)?,
+        file_hash: row.get(5)?,
+        download_url: row.get(6)?,
+        is_local: row.get(7)?,
+    })
 }
 
 pub trait ModCacheLookup {
@@ -429,6 +478,130 @@ impl<'connection> SqliteModCacheRepository<'connection> {
 
         self.find_cached_version_id_by_project(&canonical_project_id, target)
     }
+
+    /// The row a launch would use for a project on this target, **without**
+    /// requiring the jar to be on disk.
+    ///
+    /// Ordering matches `find_cached_version_id_by_project` — hashed rows
+    /// first, then newest — so "the registered version" means the same thing
+    /// whether the pre-check reports it or the launch restores it. Unlike that
+    /// lookup it keeps `is_local = 1` rows: a local jar that vanished has to be
+    /// named to be reported, even though nothing can re-download it.
+    pub fn find_registered_by_project(
+        &self,
+        project_id: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<ModCacheRecord>> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT
+                    modrinth_project_id,
+                    modrinth_version_id,
+                    jar_filename,
+                    mc_version,
+                    mod_loader,
+                    file_hash,
+                    download_url,
+                    is_local
+                FROM mod_cache
+                WHERE modrinth_project_id = ?1
+                  AND mc_version = ?2
+                  AND mod_loader = ?3
+                ORDER BY
+                    (file_hash IS NOT NULL AND trim(file_hash) <> '') DESC,
+                    rowid DESC
+                LIMIT 1
+                "#,
+                params![
+                    project_id.trim(),
+                    &target.minecraft_version,
+                    target.mod_loader.as_modrinth_loader(),
+                ],
+                record_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Same slug → canonical id bridge as `find_compatible_by_project_or_alias`.
+    pub fn find_registered_by_project_or_alias(
+        &self,
+        project_id_or_alias: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<ModCacheRecord>> {
+        if let Some(record) = self.find_registered_by_project(project_id_or_alias, target)? {
+            return Ok(Some(record));
+        }
+
+        let Some(canonical_project_id) = self.find_canonical_project_id(project_id_or_alias)?
+        else {
+            return Ok(None);
+        };
+
+        if canonical_project_id == project_id_or_alias.trim() {
+            return Ok(None);
+        }
+
+        self.find_registered_by_project(&canonical_project_id, target)
+    }
+
+    /// The row for one version id on this target, **without** requiring the jar
+    /// to be on disk. `find_by_version_id` is this plus the file check.
+    pub fn find_registered_by_version_id(
+        &self,
+        version_id: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<ModCacheRecord>> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT
+                    modrinth_project_id,
+                    modrinth_version_id,
+                    jar_filename,
+                    mc_version,
+                    mod_loader,
+                    file_hash,
+                    download_url,
+                    is_local
+                FROM mod_cache
+                WHERE modrinth_version_id = ?1
+                  AND mc_version = ?2
+                  AND mod_loader = ?3
+                "#,
+                params![
+                    version_id,
+                    &target.minecraft_version,
+                    target.mod_loader.as_modrinth_loader(),
+                ],
+                record_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Everything the cache can say about a project on this target, in one
+    /// answer: the usable row, the registered row whose jar disappeared, or
+    /// nothing at all.
+    ///
+    /// The disk-checking lookup runs first and unchanged, so a project with
+    /// several rows still launches from the newest one that kept its file.
+    pub fn probe_project(
+        &self,
+        project_id_or_alias: &str,
+        target: &ResolutionTarget,
+    ) -> Result<CacheProbe> {
+        if let Some(record) = self.find_compatible_by_project_or_alias(project_id_or_alias, target)?
+        {
+            return Ok(CacheProbe::Ready(record));
+        }
+
+        match self.find_registered_by_project_or_alias(project_id_or_alias, target)? {
+            Some(record) => Ok(classify_missing_jar(record)),
+            None => Ok(CacheProbe::NotCached),
+        }
+    }
 }
 
 impl ModCacheLookup for SqliteModCacheRepository<'_> {
@@ -437,47 +610,7 @@ impl ModCacheLookup for SqliteModCacheRepository<'_> {
         version_id: &str,
         target: &ResolutionTarget,
     ) -> Result<Option<ModCacheRecord>> {
-        let mut statement = self.connection.prepare(
-            r#"
-            SELECT
-                modrinth_project_id,
-                modrinth_version_id,
-                jar_filename,
-                mc_version,
-                mod_loader,
-                file_hash,
-                download_url,
-                is_local
-            FROM mod_cache
-            WHERE modrinth_version_id = ?1
-              AND mc_version = ?2
-              AND mod_loader = ?3
-            "#,
-        )?;
-
-        let record = statement
-            .query_row(
-                params![
-                    version_id,
-                    &target.minecraft_version,
-                    target.mod_loader.as_modrinth_loader(),
-                ],
-                |row| {
-                    Ok(ModCacheRecord {
-                        modrinth_project_id: row.get(0)?,
-                        modrinth_version_id: row.get(1)?,
-                        jar_filename: row.get(2)?,
-                        mc_version: row.get(3)?,
-                        mod_loader: row.get(4)?,
-                        file_hash: row.get(5)?,
-                        download_url: row.get(6)?,
-                        is_local: row.get(7)?,
-                    })
-                },
-            )
-            .optional()?;
-
-        match record {
+        match self.find_registered_by_version_id(version_id, target)? {
             Some(record) => self.ensure_record_file_available(record),
             None => Ok(None),
         }
@@ -655,11 +788,48 @@ pub fn pending_download_from_version(
     })
 }
 
+/// The download that puts a registered version back on disk.
+///
+/// Everything comes from the row itself — url, file name, sha1 — so what
+/// arrives is the version the cache claims to hold and not the newest one, and
+/// no API call is involved. `file_size` is unknown (`mod_cache` does not store
+/// it) and only feeds the progress total, which counts files when it is zero.
+pub fn pending_download_from_record(record: &ModCacheRecord) -> Result<PendingDownload> {
+    let download_url = record
+        .download_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .with_context(|| {
+            format!(
+                "cached version '{}' of project '{}' has no download url to restore '{}' from",
+                record.modrinth_version_id, record.modrinth_project_id, record.jar_filename
+            )
+        })?;
+
+    validate_cache_key(
+        &record.mod_loader,
+        &record.modrinth_version_id,
+        &record.jar_filename,
+    )?;
+
+    Ok(PendingDownload {
+        modrinth_project_id: record.modrinth_project_id.clone(),
+        modrinth_version_id: record.modrinth_version_id.clone(),
+        jar_filename: record.jar_filename.clone(),
+        mc_version: record.mc_version.clone(),
+        mod_loader: record.mod_loader.clone(),
+        file_hash: record.file_hash.clone(),
+        download_url: download_url.to_string(),
+        file_size: 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
@@ -672,8 +842,8 @@ mod tests {
 
     use super::{
         build_mod_acquisition_plan, cache_record_from_version, cached_artifact_path_for_record,
-        legacy_cached_artifact_path, pending_download_from_version, validate_cache_key,
-        ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
+        legacy_cached_artifact_path, pending_download_from_record, pending_download_from_version,
+        validate_cache_key, CacheProbe, ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -1124,6 +1294,146 @@ mod tests {
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// Writes the jar a record points at, so the row counts as usable.
+    fn write_jar_for(mods_cache_dir: &Path, record: &ModCacheRecord) {
+        let artifact_path = cached_artifact_path_for_record(mods_cache_dir, record);
+        fs::create_dir_all(
+            artifact_path
+                .parent()
+                .expect("artifact parent directory should exist"),
+        )
+        .expect("artifact parent directory should be created");
+        fs::write(&artifact_path, b"jar").expect("jar should be written");
+    }
+
+    #[test]
+    fn probing_a_project_tells_a_missing_row_apart_from_a_missing_jar() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        let registered = repository
+            .upsert_modrinth_version(&version("sodium", "version-1", "sodium.jar"), &target())
+            .expect("cache record should insert");
+
+        // The measured difference: the disk-checking lookup answers `None` for
+        // both mods, so a launch built on it cannot tell a mod it never had
+        // from a mod whose jar was deleted, and drops both.
+        assert!(repository
+            .find_compatible_by_project_or_alias("sodium", &target())
+            .expect("record lookup should succeed")
+            .is_none());
+        assert!(repository
+            .find_compatible_by_project_or_alias("polytone", &target())
+            .expect("record lookup should succeed")
+            .is_none());
+
+        assert_eq!(
+            repository
+                .probe_project("sodium", &target())
+                .expect("probe should succeed"),
+            CacheProbe::JarMissing(registered.clone())
+        );
+        assert_eq!(
+            repository
+                .probe_project("polytone", &target())
+                .expect("probe should succeed"),
+            CacheProbe::NotCached
+        );
+
+        write_jar_for(&mods_cache_dir, &registered);
+        assert_eq!(
+            repository
+                .probe_project("sodium", &target())
+                .expect("probe should succeed"),
+            CacheProbe::Ready(registered)
+        );
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn a_lost_jar_with_nothing_to_fetch_it_from_is_not_restorable() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        repository
+            .upsert_modrinth_version(&version("my-jar", "local-1", "my-jar.jar"), &target())
+            .expect("local record should insert");
+        repository
+            .upsert_modrinth_version(&version("urlless", "version-1", "urlless.jar"), &target())
+            .expect("url-less record should insert");
+        connection
+            .execute(
+                "UPDATE mod_cache SET is_local = 1 WHERE modrinth_version_id = ?1",
+                ["local-1"],
+            )
+            .expect("row should become local");
+        connection
+            .execute(
+                "UPDATE mod_cache SET download_url = NULL WHERE modrinth_version_id = ?1",
+                ["version-1"],
+            )
+            .expect("download url should be nulled");
+
+        // A copied jar has no Modrinth url, and neither has a row saved without
+        // one: both are lost jars, and neither can be fetched again from here.
+        for project in ["my-jar", "urlless"] {
+            let probe = repository
+                .probe_project(project, &target())
+                .expect("probe should succeed");
+            assert!(
+                matches!(probe, CacheProbe::JarMissingUnrecoverable(_)),
+                "{project} should be unrestorable, got {probe:?}"
+            );
+        }
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn the_restore_download_carries_the_registered_version() {
+        let record = ModCacheRecord {
+            modrinth_project_id: "sodium".into(),
+            modrinth_version_id: "version-1".into(),
+            jar_filename: "sodium-0.5.8.jar".into(),
+            mc_version: "1.21.1".into(),
+            mod_loader: "fabric".into(),
+            file_hash: Some("version-1-sha1".into()),
+            download_url: Some(" https://cdn.modrinth.com/data/sodium/sodium-0.5.8.jar ".into()),
+            is_local: false,
+        };
+
+        let pending = pending_download_from_record(&record).expect("download should build");
+
+        assert_eq!(pending.modrinth_version_id, "version-1");
+        assert_eq!(pending.jar_filename, "sodium-0.5.8.jar");
+        assert_eq!(
+            pending.download_url,
+            "https://cdn.modrinth.com/data/sodium/sodium-0.5.8.jar"
+        );
+        assert_eq!(pending.file_hash.as_deref(), Some("version-1-sha1"));
+
+        let urlless = ModCacheRecord {
+            download_url: None,
+            ..record
+        };
+        assert!(pending_download_from_record(&urlless).is_err());
     }
 
     #[test]

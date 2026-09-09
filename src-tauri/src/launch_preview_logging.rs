@@ -186,14 +186,21 @@ impl LaunchLogSession {
         self.write_file("dependencies.log", &lines)
     }
 
+    /// `restored_records` are cache rows whose jar is gone and that the launch
+    /// re-downloads at that same version: they belong to the resolved set, and
+    /// the marker is what tells them apart from a jar that was already there.
     pub(super) fn write_resolved_versions(
         &self,
         remote_versions: &[ModrinthVersion],
         cached_records: &[ModCacheRecord],
+        restored_records: &[ModCacheRecord],
     ) -> Result<()> {
         let mut lines = vec![
             format!("live_versions={}", remote_versions.len()),
-            format!("cached_records={}", cached_records.len()),
+            format!(
+                "cached_records={}",
+                cached_records.len() + restored_records.len()
+            ),
             String::new(),
             "[live_versions]".to_string(),
         ];
@@ -213,13 +220,18 @@ impl LaunchLogSession {
 
         lines.push(String::new());
         lines.push("[cached_records]".to_string());
-        for record in cached_records {
+        for (record, restored) in cached_records
+            .iter()
+            .map(|record| (record, false))
+            .chain(restored_records.iter().map(|record| (record, true)))
+        {
             lines.push(format!(
-                "{} | version_id={} | jar={} | local={}",
+                "{} | version_id={} | jar={} | local={}{}",
                 record.modrinth_project_id,
                 record.modrinth_version_id,
                 record.jar_filename,
-                record.is_local
+                record.is_local,
+                if restored { " | restored=true" } else { "" }
             ));
         }
 

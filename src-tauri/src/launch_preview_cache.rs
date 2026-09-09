@@ -22,8 +22,8 @@ use crate::instance_mods::CachedModJar;
 use crate::launcher_paths::LauncherPaths;
 use crate::mod_cache::{
     build_mod_acquisition_plan, cache_record_from_version, cached_artifact_path_for_record,
-    cached_local_artifact_path, pending_download_from_version, ModAcquisitionPlan, ModCacheLookup,
-    ModCacheRecord, SqliteModCacheRepository,
+    cached_local_artifact_path, pending_download_from_record, pending_download_from_version,
+    CacheProbe, ModAcquisitionPlan, ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
 };
 use crate::modrinth::ModrinthVersion;
 use crate::process_streaming::ProcessLogStream;
@@ -96,6 +96,24 @@ pub(super) fn load_cached_mod_record_by_version(
     })?;
     let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
     repository.find_by_version_id(version_id, target)
+}
+
+/// `load_cached_mod_record_for_target` plus the answer it cannot give: whether
+/// a mod with no usable artifact was never cached, or is registered and lost
+/// its jar.
+pub(super) fn probe_cached_mod_for_target(
+    launcher_paths: &LauncherPaths,
+    project_id: &str,
+    target: &ResolutionTarget,
+) -> Result<CacheProbe> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
+    repository.probe_project(project_id, target)
 }
 
 /// One cache column per selected Modrinth mod, on this target, keyed by the mod
@@ -216,10 +234,17 @@ pub(super) fn load_cached_dependency_requests(
     Ok(requests)
 }
 
+/// The cache-only acquisition plan.
+///
+/// Three inputs, one per kind of artifact the selection pass produced: live
+/// versions (a version the cache does not hold, whose metadata came from
+/// Modrinth), records with their jar in place, and records whose jar is gone
+/// and that the download stage has to restore **at the registered version**.
 pub(super) fn build_remote_acquisition_plan_from_artifacts(
     launcher_paths: &LauncherPaths,
     live_versions: &[ModrinthVersion],
     cached_records: &[ModCacheRecord],
+    missing_jar_records: &[ModCacheRecord],
     target: &ResolutionTarget,
 ) -> Result<ModAcquisitionPlan> {
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
@@ -237,6 +262,12 @@ pub(super) fn build_remote_acquisition_plan_from_artifacts(
     for record in cached_records {
         if seen_version_ids.insert(record.modrinth_version_id.clone()) {
             cached.push(record.clone());
+        }
+    }
+
+    for record in missing_jar_records {
+        if seen_version_ids.insert(record.modrinth_version_id.clone()) {
+            to_download.push(pending_download_from_record(record)?);
         }
     }
 
@@ -606,6 +637,7 @@ pub(super) fn build_cached_mod_jars(
     selected_mods: &[SelectedMod],
     versions: &[ModrinthVersion],
     cached_records: &[ModCacheRecord],
+    restored_records: &[ModCacheRecord],
     target: &ResolutionTarget,
     launcher_paths: &LauncherPaths,
     modlist_name: &str,
@@ -653,7 +685,10 @@ pub(super) fn build_cached_mod_jars(
         }
     }
 
-    for record in cached_records {
+    // A restored record's jar lands at the same cache path as an intact one:
+    // the download stage has already put it back by the time this runs, so the
+    // two kinds link identically.
+    for record in cached_records.iter().chain(restored_records) {
         if seen.insert(record.jar_filename.clone()) {
             jars.push(CachedModJar {
                 jar_filename: record.jar_filename.clone(),

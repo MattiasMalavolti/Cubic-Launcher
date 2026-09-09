@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::launcher_paths::LauncherPaths;
 use crate::path_safety::validate_path_component;
-use crate::mod_cache::ModCacheRecord;
+use crate::mod_cache::{CacheProbe, ModCacheRecord};
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{
@@ -19,7 +19,7 @@ use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
 
 use super::{
     embedded_minecraft_requirements_match, emit_log, ensure_remote_version_cached,
-    load_cached_file_hashes_for_selected, load_cached_mod_record_for_target,
+    load_cached_file_hashes_for_selected, probe_cached_mod_for_target,
     read_embedded_fabric_requirements, SelectedMod,
 };
 
@@ -31,8 +31,16 @@ pub(super) struct TopLevelVersionCandidates {
 
 #[derive(Debug, Clone)]
 pub(super) enum RemoteArtifact {
+    /// A version the cache does not hold, with the metadata the download stage
+    /// needs. In cache-only mode this only happens for a version a pre-check
+    /// named: an update just accepted is not in the cache by definition.
     Live(ModrinthVersion),
+    /// A cached version whose jar is on disk.
     Cached(ModCacheRecord),
+    /// A registered version whose jar is gone from the cache directory. The
+    /// row carries the url and the hash, so the launch restores exactly that
+    /// version without asking Modrinth anything.
+    MissingJar(ModCacheRecord),
 }
 /// Pick the preferred candidate by channel first, then by `date_published`
 /// (RFC3339 UTC, so lexicographic comparison is chronological). Candidates are
@@ -546,53 +554,129 @@ pub(super) fn collect_selected_mods(
 pub(super) fn remote_artifact_project_id(artifact: &RemoteArtifact) -> &str {
     match artifact {
         RemoteArtifact::Live(version) => &version.project_id,
-        RemoteArtifact::Cached(record) => &record.modrinth_project_id,
+        RemoteArtifact::Cached(record) | RemoteArtifact::MissingJar(record) => {
+            &record.modrinth_project_id
+        }
     }
 }
 
-pub(super) fn split_remote_artifacts(
-    artifacts: &[RemoteArtifact],
-) -> (Vec<ModrinthVersion>, Vec<ModCacheRecord>) {
-    let mut live_versions = Vec::new();
-    let mut cached_records = Vec::new();
+/// The three artifact kinds as the three lists the download stage and the
+/// instance-linking stage consume, deduplicated by version id.
+#[derive(Debug, Default)]
+pub(super) struct RemoteArtifactSplit {
+    pub(super) live_versions: Vec<ModrinthVersion>,
+    pub(super) cached_records: Vec<ModCacheRecord>,
+    pub(super) missing_jar_records: Vec<ModCacheRecord>,
+}
+
+pub(super) fn split_remote_artifacts(artifacts: &[RemoteArtifact]) -> RemoteArtifactSplit {
+    let mut split = RemoteArtifactSplit::default();
     let mut seen_version_ids = HashSet::new();
 
     for artifact in artifacts {
         match artifact {
             RemoteArtifact::Live(version) => {
                 if seen_version_ids.insert(version.id.clone()) {
-                    live_versions.push(version.clone());
+                    split.live_versions.push(version.clone());
                 }
             }
             RemoteArtifact::Cached(record) => {
                 if seen_version_ids.insert(record.modrinth_version_id.clone()) {
-                    cached_records.push(record.clone());
+                    split.cached_records.push(record.clone());
+                }
+            }
+            RemoteArtifact::MissingJar(record) => {
+                if seen_version_ids.insert(record.modrinth_version_id.clone()) {
+                    split.missing_jar_records.push(record.clone());
                 }
             }
         }
     }
 
-    (live_versions, cached_records)
+    split
 }
 
-pub(super) async fn resolve_selected_remote_artifacts(
+/// One cache probe per distinct selected Modrinth mod, in resolution order.
+///
+/// No network and no logging: both cache-only passes over the same mod list
+/// want the same answer, and only the second one — the one that runs on the
+/// mods the re-resolution actually kept — reports it.
+pub(super) fn probe_selected_mods(
+    launcher_paths: &LauncherPaths,
+    selected_mods: &[SelectedMod],
+    target: &ResolutionTarget,
+) -> Result<Vec<(String, CacheProbe)>> {
+    let mut probes = Vec::new();
+    let mut seen = HashSet::new();
+
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth) || !seen.insert(&selected.mod_id) {
+            continue;
+        }
+
+        probes.push((
+            selected.mod_id.clone(),
+            probe_cached_mod_for_target(launcher_paths, &selected.mod_id, target)?,
+        ));
+    }
+
+    Ok(probes)
+}
+
+/// A mod the cache cannot serve and nothing can restore, with the reason.
+/// `resolve_cache_only_selection` treats it as unavailable — today's
+/// behaviour — and the launch names it once instead of dropping it in silence.
+fn log_unusable_probe(app_handle: &tauri::AppHandle, mod_id: &str, probe: &CacheProbe) {
+    let message = match probe {
+        CacheProbe::JarMissingUnrecoverable(record) if record.is_local => format!(
+            "[Cache] the cached jar of local mod '{}' is gone ({}); a locally copied jar has no Modrinth download url, so it cannot be restored and the mod is skipped",
+            mod_id, record.jar_filename
+        ),
+        CacheProbe::JarMissingUnrecoverable(record) => format!(
+            "[Cache] the cached jar of '{}' is gone ({}, version {}) and its cache row has no download url, so it cannot be restored and the mod is skipped",
+            mod_id, record.jar_filename, record.modrinth_version_id
+        ),
+        CacheProbe::NotCached => format!(
+            "[Cache] '{mod_id}' has never been cached for this target and cache-only mode has no way to fetch it; the mod is skipped"
+        ),
+        CacheProbe::Ready(_) | CacheProbe::JarMissing(_) => return,
+    };
+
+    let _ = emit_log(app_handle, ProcessLogStream::Stderr, message);
+}
+
+/// What the launch installs for the selected mods in cache-only mode.
+///
+/// A registered row whose jar disappeared is its own case: the launch restores
+/// it at the version the row names, from the row's own url and hash, so
+/// "launch from your cached versions" cannot drift into "launch from the
+/// newest". A mod with nothing to install is named once instead of leaving the
+/// game in silence.
+pub(super) fn resolve_selected_remote_artifacts(
+    app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
     selected_mods: &[SelectedMod],
     target: &ResolutionTarget,
 ) -> Result<HashMap<String, RemoteArtifact>> {
     let mut artifacts = HashMap::new();
 
-    for selected in selected_mods {
-        if !matches!(selected.source, ModSource::Modrinth)
-            || artifacts.contains_key(&selected.mod_id)
-        {
-            continue;
-        }
-
-        if let Some(record) =
-            load_cached_mod_record_for_target(launcher_paths, &selected.mod_id, target)?
-        {
-            artifacts.insert(selected.mod_id.clone(), RemoteArtifact::Cached(record));
+    for (mod_id, probe) in probe_selected_mods(launcher_paths, selected_mods, target)? {
+        match probe {
+            CacheProbe::Ready(record) => {
+                artifacts.insert(mod_id, RemoteArtifact::Cached(record));
+            }
+            CacheProbe::JarMissing(record) => {
+                let _ = emit_log(
+                    app_handle,
+                    ProcessLogStream::Stderr,
+                    format!(
+                        "[Cache] the cached jar of '{}' is gone ({}); re-downloading the registered version {} instead of the newest one",
+                        mod_id, record.jar_filename, record.modrinth_version_id
+                    ),
+                );
+                artifacts.insert(mod_id, RemoteArtifact::MissingJar(record));
+            }
+            other => log_unusable_probe(app_handle, &mod_id, &other),
         }
     }
 
@@ -838,20 +922,27 @@ pub(super) async fn resolve_online_selection(
     })
 }
 
-/// Same as `resolve_online_selection`, with a valid cached artifact counting as
+/// Same as `resolve_online_selection`, with a cached artifact counting as
 /// available and no network at all.
-pub(super) async fn resolve_cache_only_selection(
+///
+/// "Available" now covers a registered row whose jar disappeared, because the
+/// launch restores it; a mod is only disabled when nothing can produce a jar
+/// for it.
+pub(super) fn resolve_cache_only_selection(
     launcher_paths: &LauncherPaths,
     modlist: &ModList,
     target: &ResolutionTarget,
 ) -> Result<TargetSelection> {
     let resolution = resolve_modlist(modlist, target)?;
     let selected = collect_selected_mods(modlist, &resolution, target);
-    let available_artifacts =
-        resolve_selected_remote_artifacts(launcher_paths, &selected, target).await?;
-    let unavailable = unavailable_selected_mods(&selected, |mod_id| {
-        available_artifacts.contains_key(mod_id)
-    });
+    let acquirable = probe_selected_mods(launcher_paths, &selected, target)?
+        .into_iter()
+        .filter(|(_, probe)| {
+            matches!(probe, CacheProbe::Ready(_) | CacheProbe::JarMissing(_))
+        })
+        .map(|(mod_id, _)| mod_id)
+        .collect::<HashSet<_>>();
+    let unavailable = unavailable_selected_mods(&selected, |mod_id| acquirable.contains(mod_id));
     let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
     let selected_mods = collect_selected_mods(modlist, &resolution, target);
 
@@ -1288,5 +1379,40 @@ mod tests {
 
         assert!(all.is_empty());
         assert!(dropped.is_empty());
+    }
+
+    fn cached_record(version_id: &str, jar: &str) -> ModCacheRecord {
+        ModCacheRecord {
+            modrinth_project_id: "sodium".into(),
+            modrinth_version_id: version_id.into(),
+            jar_filename: jar.into(),
+            mc_version: "1.20.1".into(),
+            mod_loader: "forge".into(),
+            file_hash: Some(format!("{version_id}-sha1")),
+            download_url: Some(format!("https://cdn.modrinth.com/data/sodium/{jar}")),
+            is_local: false,
+        }
+    }
+
+    #[test]
+    fn splitting_artifacts_keeps_the_restorable_ones_apart_from_the_usable_ones() {
+        let cached = cached_record("sodium-v1", "sodium-0.5.8.jar");
+        let missing = cached_record("lithium-v1", "lithium-0.11.jar");
+        let live = test_version("iris-v3", "2026-01-01T00:00:00Z");
+
+        let split = split_remote_artifacts(&[
+            RemoteArtifact::Cached(cached.clone()),
+            RemoteArtifact::MissingJar(missing.clone()),
+            RemoteArtifact::Live(live.clone()),
+            // Two mods can resolve to the same version id; the download stage
+            // must see it once.
+            RemoteArtifact::MissingJar(missing.clone()),
+            RemoteArtifact::Live(live.clone()),
+        ]);
+
+        assert_eq!(split.cached_records, vec![cached]);
+        assert_eq!(split.missing_jar_records, vec![missing]);
+        assert_eq!(split.live_versions.len(), 1);
+        assert_eq!(split.live_versions[0].id, live.id);
     }
 }

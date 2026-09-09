@@ -51,7 +51,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
 
     launch_log_session.write_selected_mods(&selected_mods)?;
     launch_log_session.write_dependency_summary(&dependency_resolution)?;
-    launch_log_session.write_resolved_versions(&[], &[])?;
+    launch_log_session.write_resolved_versions(&[], &[], &[])?;
     launch_log_session.write_cache_plan(&acquisition_plan)?;
     launch_log_session.write_final_mod_set(&cached_mod_jars)?;
     launch_log_session.append_summary_line("vanilla_direct_launch=true")?;

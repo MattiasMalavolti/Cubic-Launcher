@@ -283,7 +283,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         .as_ref()
         .filter(|versions| !versions.is_empty());
     let selection = if effective_settings.cache_only_mode {
-        resolve_cache_only_selection(&launcher_paths, &modlist, &target).await?
+        resolve_cache_only_selection(&launcher_paths, &modlist, &target)?
     } else {
         resolve_online_selection(
             &app_handle,
@@ -319,6 +319,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     let (
         all_remote_versions,
         cached_remote_records,
+        missing_jar_records,
         dependency_resolution,
         effective_required_java,
         project_aliases,
@@ -330,11 +331,15 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
                 .to_string(),
         )?;
 
-        let parent_artifacts =
-            resolve_selected_remote_artifacts(&launcher_paths, &selected_mods, &target).await?;
+        let parent_artifacts = resolve_selected_remote_artifacts(
+            &app_handle,
+            &launcher_paths,
+            &selected_mods,
+            &target,
+        )?;
         let parent_artifact_values = parent_artifacts.into_values().collect::<Vec<_>>();
-        let (parent_versions, cached_parent_records) =
-            split_remote_artifacts(&parent_artifact_values);
+        let split = split_remote_artifacts(&parent_artifact_values);
+        let parent_versions = split.live_versions;
 
         // DESIGN: the launcher does not manage dependencies. Detect & report the
         // requirements the selected mods DECLARE (best-effort over the live
@@ -352,7 +357,8 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
 
         (
             parent_versions,
-            cached_parent_records,
+            split.cached_records,
+            split.missing_jar_records,
             DependencyResolution::default(),
             required_java_version_for_minecraft(&target.minecraft_version)?,
             Vec::new(),
@@ -429,13 +435,18 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         (
             parent_versions,
             Vec::new(),
+            Vec::new(),
             DependencyResolution::default(),
             required_java_version_for_minecraft(&target.minecraft_version)?,
             project_aliases,
         )
     };
     launch_log_session.write_dependency_summary(&dependency_resolution)?;
-    launch_log_session.write_resolved_versions(&all_remote_versions, &cached_remote_records)?;
+    launch_log_session.write_resolved_versions(
+        &all_remote_versions,
+        &cached_remote_records,
+        &missing_jar_records,
+    )?;
     launch_log_session.append_summary_line(&format!(
         "cache_only_mode={}",
         effective_settings.cache_only_mode
@@ -466,6 +477,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             &launcher_paths,
             &all_remote_versions,
             &cached_remote_records,
+            &missing_jar_records,
             &target,
         )?
     } else {
@@ -557,6 +569,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &selected_mods,
         &all_remote_versions,
         &cached_remote_records,
+        &missing_jar_records,
         &target,
         &launcher_paths,
         &modlist_name,
