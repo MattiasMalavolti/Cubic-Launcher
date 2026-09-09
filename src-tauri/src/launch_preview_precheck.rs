@@ -207,9 +207,10 @@ pub(super) fn build_precheck_result(
 /// What a launch of this mod-list on this target would change.
 ///
 /// Reads the database and Modrinth, writes nothing: no launch log session, no
-/// download, no cache row. `cache_only_mode` is deliberately not consulted —
-/// whether the popup appears, and when the check runs, are A2/A3 decisions, and
-/// a mod that was never downloaded has to be resolved even with the popup off.
+/// download, no cache row. The update notification setting is deliberately not
+/// consulted — it decides whether the popup appears, not whether the check
+/// runs, and a mod that was never downloaded has to be resolved even with the
+/// popup off or the launch has no version to install it from.
 pub(super) async fn run_update_precheck(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,

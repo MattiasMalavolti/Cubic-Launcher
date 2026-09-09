@@ -84,7 +84,6 @@ pub(super) struct EffectiveLaunchSettings {
     pub(super) min_ram_mb: u32,
     pub(super) max_ram_mb: u32,
     pub(super) custom_jvm_args: String,
-    pub(super) cache_only_mode: bool,
     pub(super) wrapper_command: Option<String>,
     pub(super) java_path_override: Option<PathBuf>,
 }
@@ -134,6 +133,53 @@ pub(super) struct StartedLaunch {
     pub(super) launch_log_dir: PathBuf,
 }
 
+/// Which of the two resolution paths a launch takes.
+///
+/// The question is "do I have a version map?", not "what setting has the
+/// user": the update notification setting decides whether the popup appears,
+/// never what the launch installs.
+///
+/// The two paths are not interchangeable and must not be merged. `Resolve`
+/// exists for the degraded case — the pre-check failed (D19) or never ran —
+/// where a mod that was just added and never downloaded has no cached jar to
+/// launch from and would otherwise never be installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LaunchResolutionPath<'a> {
+    /// Install exactly the versions the map names, taking them from the cache
+    /// where possible and asking Modrinth nothing to decide which.
+    Preresolved(&'a HashMap<String, String>),
+    /// Resolve versions the way a launch without a pre-check always has, and
+    /// download what is missing.
+    Resolve,
+}
+
+impl<'a> LaunchResolutionPath<'a> {
+    /// An empty map is absent: it carries no decision, and reading it as one
+    /// would leave every mod uncovered on the path that trusts the map.
+    pub(super) fn for_launch(resolved_versions: Option<&'a HashMap<String, String>>) -> Self {
+        match resolved_versions.filter(|versions| !versions.is_empty()) {
+            Some(versions) => Self::Preresolved(versions),
+            None => Self::Resolve,
+        }
+    }
+
+    /// The map, for the stages that pass it down unchanged.
+    pub(super) fn preresolved(&self) -> Option<&'a HashMap<String, String>> {
+        match self {
+            Self::Preresolved(versions) => Some(versions),
+            Self::Resolve => None,
+        }
+    }
+
+    /// The `launch_branch=` value in `summary.log`.
+    pub(super) fn summary_label(&self) -> &'static str {
+        match self {
+            Self::Preresolved(_) => "preresolved_versions",
+            Self::Resolve => "resolve",
+        }
+    }
+}
+
 impl LaunchVerificationRequest {
     pub(super) fn into_launch_request(self) -> LaunchRequest {
         LaunchRequest {
@@ -167,8 +213,6 @@ impl EffectiveLaunchSettings {
             .to_string();
         let java_path_override = global.java_path_override.trim();
 
-        let cache_only_mode = automation_cache_only_override().unwrap_or(global.cache_only_mode);
-
         Self {
             min_ram_mb: overrides.min_ram_mb.unwrap_or(global.min_ram_mb),
             max_ram_mb: overrides.max_ram_mb.unwrap_or(global.max_ram_mb),
@@ -176,7 +220,6 @@ impl EffectiveLaunchSettings {
                 .custom_jvm_args
                 .clone()
                 .unwrap_or_else(|| global.custom_jvm_args.clone()),
-            cache_only_mode,
             wrapper_command: if wrapper_command.is_empty() {
                 None
             } else {
@@ -257,23 +300,4 @@ fn default_terminate_on_success() -> bool {
 
 fn default_terminate_on_timeout() -> bool {
     true
-}
-
-fn automation_cache_only_override() -> Option<bool> {
-    // S2: only honor CUBIC_AUTOMATION_CACHE_ONLY_MODE when the automation
-    // entry-point is active. This prevents an inherited env value from silently
-    // overriding the user's cache_only_mode in a normal production launch.
-    if std::env::var("CUBIC_AUTOMATION_VERIFY_REQUEST")
-        .ok()
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true)
-    {
-        return None;
-    }
-    let value = std::env::var("CUBIC_AUTOMATION_CACHE_ONLY_MODE").ok()?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "on" => Some(true),
-        "0" | "false" | "off" => Some(false),
-        _ => None,
-    }
 }

@@ -269,42 +269,49 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
 
     // Verify Modrinth availability for resolved mods. If a resolved mod has no
     // compatible version on Modrinth, temporarily disable it and re-resolve so
-    // alternatives get a chance. In cache-only mode, a valid cached artifact
-    // also counts as available.
+    // alternatives get a chance. On the preresolved path a valid cached
+    // artifact also counts as available.
     //
     // Both branches live in `launch_preview_artifacts.rs` because the update
     // pre-check runs the online one too: it has to name exactly the mods this
     // launch will install.
-    //
-    // An empty map counts as absent: it carries no decision, and treating it as
-    // one would disable every mod.
-    let preresolved_versions = request
-        .resolved_versions
-        .as_ref()
-        .filter(|versions| !versions.is_empty());
-    let selection = if effective_settings.cache_only_mode {
-        resolve_cache_only_selection(&launcher_paths, &modlist, &target, preresolved_versions)?
-    } else {
-        resolve_online_selection(
-            &app_handle,
-            &launcher_paths,
-            &http_client,
-            &modlist,
-            &modrinth_client,
-            &target,
-            preresolved_versions,
-        )
-        .await?
+    let resolution_path = LaunchResolutionPath::for_launch(request.resolved_versions.as_ref());
+    // `None` on the `Resolve` path, always — the path is chosen by the map's
+    // presence. The online branch below keeps reading it so that "no map" is
+    // literally today's path, unchanged: whether that branch should still
+    // carry its map handling is part of the merge-the-two-branches decision
+    // this task does not take.
+    let preresolved_versions = resolution_path.preresolved();
+    let selection = match resolution_path {
+        LaunchResolutionPath::Preresolved(preresolved) => {
+            resolve_cache_only_selection(&launcher_paths, &modlist, &target, Some(preresolved))?
+        }
+        LaunchResolutionPath::Resolve => {
+            resolve_online_selection(
+                &app_handle,
+                &launcher_paths,
+                &http_client,
+                &modlist,
+                &modrinth_client,
+                &target,
+                // No map on this path, by construction.
+                None,
+            )
+            .await?
+        }
     };
     log_resolution(&app_handle, &selection.resolution)?;
 
     let selected_mods = selection.selected_mods;
     launch_log_session.write_selected_mods(&selected_mods)?;
     if selected_mods.len() > 300 {
-        let detail = if effective_settings.cache_only_mode {
-            "You have more than 300 mods. The first launch may still take 1-2 minutes, but cache-only mode is already enabled for future launches."
-        } else {
-            "You have more than 300 mods. The first launch may take 1-2 minutes due to API rate limits. You can enable \"Cache-Only Mode\" in Settings to skip API checks on future launches."
+        let detail = match resolution_path {
+            LaunchResolutionPath::Preresolved(_) => {
+                "You have more than 300 mods. The versions were already chosen before this launch, so only the jars you do not have yet are downloaded."
+            }
+            LaunchResolutionPath::Resolve => {
+                "You have more than 300 mods and this launch has no pre-checked versions to start from, so every version is resolved against Modrinth: it may take 1-2 minutes due to API rate limits."
+            }
         };
         emit_launcher_issue(
             &app_handle,
@@ -323,12 +330,14 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         dependency_resolution,
         effective_required_java,
         project_aliases,
-    ) = if effective_settings.cache_only_mode {
+    ) = if let LaunchResolutionPath::Preresolved(preresolved) = resolution_path {
         emit_log(
             &app_handle,
             ProcessLogStream::Stdout,
-            "[Cache] Cache-only mode enabled. Reusing cached artifacts only; uncached mods are skipped."
-                .to_string(),
+            format!(
+                "[Cache] Launching from the {} versions chosen before launch; the cache answers first and only what is missing is fetched.",
+                preresolved.len()
+            ),
         )?;
 
         let parent_artifacts = resolve_selected_remote_artifacts(
@@ -337,7 +346,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             &selected_mods,
             &modrinth_client,
             &target,
-            preresolved_versions,
+            Some(preresolved),
         )
         .await?;
         // The rows for the versions fetched here are written at the end of the
@@ -464,8 +473,8 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &missing_jar_records,
     )?;
     launch_log_session.append_summary_line(&format!(
-        "cache_only_mode={}",
-        effective_settings.cache_only_mode
+        "launch_branch={}",
+        resolution_path.summary_label()
     ))?;
     launch_log_session.append_summary_line(&format!("selected_mods={}", selected_mods.len()))?;
     launch_log_session.append_summary_line(&format!(
@@ -488,7 +497,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "Inspecting cached mods and downloading missing dependencies.",
     )?;
 
-    let acquisition_plan = if effective_settings.cache_only_mode {
+    let acquisition_plan = if matches!(resolution_path, LaunchResolutionPath::Preresolved(_)) {
         build_remote_acquisition_plan_from_artifacts(
             &launcher_paths,
             &all_remote_versions,

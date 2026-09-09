@@ -49,7 +49,17 @@ pub struct ShellGlobalSettings {
     pub max_ram_mb: u32,
     pub custom_jvm_args: String,
     pub profiler_enabled: bool,
-    pub cache_only_mode: bool,
+    /// Whether a launch may stop to show the update popup. It does not decide
+    /// whether the update pre-check runs: the launch needs the pre-check's
+    /// version map either way, or a mod that was never downloaded would never
+    /// be installed.
+    pub update_notifications_enabled: bool,
+    /// The content categories the popup may report on. Mods are always
+    /// included and have no flag. Persisted only: the content-pack side of the
+    /// pre-check is C4, so nothing reads these three yet.
+    pub update_notifications_resource_packs: bool,
+    pub update_notifications_data_packs: bool,
+    pub update_notifications_shaders: bool,
     pub wrapper_command: String,
     pub java_path_override: String,
 }
@@ -73,7 +83,10 @@ pub struct ShellGlobalSettingsInput {
     pub max_ram_mb: u32,
     pub custom_jvm_args: String,
     pub profiler_enabled: bool,
-    pub cache_only_mode: bool,
+    pub update_notifications_enabled: bool,
+    pub update_notifications_resource_packs: bool,
+    pub update_notifications_data_packs: bool,
+    pub update_notifications_shaders: bool,
     pub wrapper_command: String,
     pub java_path_override: String,
 }
@@ -387,7 +400,24 @@ fn load_global_settings(connection: &Connection) -> Result<ShellGlobalSettings> 
             .cloned()
             .unwrap_or_else(|| "-XX:+UseG1GC -XX:+ParallelRefProcEnabled".to_string()),
         profiler_enabled: parse_bool_setting(&values, "profiler_enabled").unwrap_or(false),
-        cache_only_mode: parse_bool_setting(&values, "cache_only_mode").unwrap_or(false),
+        // D12: no migration. The keys are new, the rows are not there, and the
+        // default is what a fresh install gets: notifications on, every
+        // category included. The orphaned `cache_only_mode` row is ignored
+        // until the first save rewrites the table.
+        update_notifications_enabled: parse_bool_setting(&values, "update_notifications_enabled")
+            .unwrap_or(true),
+        update_notifications_resource_packs: parse_bool_setting(
+            &values,
+            "update_notifications_resource_packs",
+        )
+        .unwrap_or(true),
+        update_notifications_data_packs: parse_bool_setting(
+            &values,
+            "update_notifications_data_packs",
+        )
+        .unwrap_or(true),
+        update_notifications_shaders: parse_bool_setting(&values, "update_notifications_shaders")
+            .unwrap_or(true),
         wrapper_command: values.get("wrapper_command").cloned().unwrap_or_default(),
         java_path_override: values
             .get("java_path_override")
@@ -432,23 +462,22 @@ pub fn save_global_settings(
         ("min_ram_mb", settings.min_ram_mb.to_string()),
         ("max_ram_mb", settings.max_ram_mb.to_string()),
         ("custom_jvm_args", settings.custom_jvm_args.clone()),
+        ("profiler_enabled", bool_setting(settings.profiler_enabled)),
         (
-            "profiler_enabled",
-            if settings.profiler_enabled {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
+            "update_notifications_enabled",
+            bool_setting(settings.update_notifications_enabled),
         ),
         (
-            "cache_only_mode",
-            if settings.cache_only_mode {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
+            "update_notifications_resource_packs",
+            bool_setting(settings.update_notifications_resource_packs),
+        ),
+        (
+            "update_notifications_data_packs",
+            bool_setting(settings.update_notifications_data_packs),
+        ),
+        (
+            "update_notifications_shaders",
+            bool_setting(settings.update_notifications_shaders),
         ),
         ("wrapper_command", settings.wrapper_command.clone()),
         ("java_path_override", settings.java_path_override.clone()),
@@ -539,6 +568,12 @@ fn parse_bool_setting(settings: &HashMap<String, String>, key: &str) -> Option<b
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// The written form of a boolean setting, in the spelling `parse_bool_setting`
+/// reads back.
+fn bool_setting(value: bool) -> String {
+    if value { "true" } else { "false" }.to_string()
 }
 
 fn replace_global_settings(connection: &Connection, values: &[(&str, String)]) -> Result<()> {
@@ -706,6 +741,13 @@ mod tests {
         assert!(snapshot.active_account.is_none());
         assert_eq!(snapshot.global_settings.min_ram_mb, 2048);
         assert_eq!(snapshot.global_settings.max_ram_mb, 4096);
+        // D12: no migration, so a database that has never seen these keys —
+        // which after the rename is every database — must come up with
+        // notifications on and all three categories included.
+        assert!(snapshot.global_settings.update_notifications_enabled);
+        assert!(snapshot.global_settings.update_notifications_resource_packs);
+        assert!(snapshot.global_settings.update_notifications_data_packs);
+        assert!(snapshot.global_settings.update_notifications_shaders);
         assert_eq!(snapshot.selected_modlist_overrides.modlist_name, None);
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
@@ -761,7 +803,13 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO global_settings (key, value) VALUES (?1, ?2)",
-                params!["cache_only_mode", "true"],
+                params!["update_notifications_enabled", "false"],
+            )
+            .expect("global setting should insert");
+        connection
+            .execute(
+                "INSERT INTO global_settings (key, value) VALUES (?1, ?2)",
+                params!["update_notifications_shaders", "false"],
             )
             .expect("global setting should insert");
         connection
@@ -803,7 +851,12 @@ mod tests {
         );
         assert_eq!(snapshot.global_settings.min_ram_mb, 3072);
         assert_eq!(snapshot.global_settings.max_ram_mb, 5120);
-        assert!(snapshot.global_settings.cache_only_mode);
+        // A stored `false` has to beat the `true` default, and the two
+        // category rows nobody wrote have to fall back to it.
+        assert!(!snapshot.global_settings.update_notifications_enabled);
+        assert!(!snapshot.global_settings.update_notifications_shaders);
+        assert!(snapshot.global_settings.update_notifications_resource_packs);
+        assert!(snapshot.global_settings.update_notifications_data_packs);
         assert_eq!(snapshot.global_settings.wrapper_command, "gamemoderun");
         assert_eq!(
             snapshot
@@ -852,7 +905,10 @@ mod tests {
                 max_ram_mb: 6144,
                 custom_jvm_args: "-Dglobal=true".into(),
                 profiler_enabled: true,
-                cache_only_mode: true,
+                update_notifications_enabled: false,
+                update_notifications_resource_packs: true,
+                update_notifications_data_packs: false,
+                update_notifications_shaders: true,
                 wrapper_command: "gamemoderun".into(),
                 java_path_override: "/custom/java".into(),
             },
@@ -882,7 +938,12 @@ mod tests {
         assert_eq!(snapshot.global_settings.max_ram_mb, 6144);
         assert_eq!(snapshot.global_settings.custom_jvm_args, "-Dglobal=true");
         assert!(snapshot.global_settings.profiler_enabled);
-        assert!(snapshot.global_settings.cache_only_mode);
+        // Mixed on purpose: a key swapped between save and load flips one of
+        // these four.
+        assert!(!snapshot.global_settings.update_notifications_enabled);
+        assert!(snapshot.global_settings.update_notifications_resource_packs);
+        assert!(!snapshot.global_settings.update_notifications_data_packs);
+        assert!(snapshot.global_settings.update_notifications_shaders);
         assert_eq!(snapshot.global_settings.wrapper_command, "gamemoderun");
         assert_eq!(snapshot.global_settings.java_path_override, "/custom/java");
         assert_eq!(
@@ -928,7 +989,10 @@ mod tests {
             max_ram_mb,
             custom_jvm_args: String::new(),
             profiler_enabled: false,
-            cache_only_mode: false,
+            update_notifications_enabled: true,
+            update_notifications_resource_packs: true,
+            update_notifications_data_packs: true,
+            update_notifications_shaders: true,
             wrapper_command: String::new(),
             java_path_override: String::new(),
         };

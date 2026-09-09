@@ -674,7 +674,7 @@ fn log_unusable_probe(app_handle: &tauri::AppHandle, mod_id: &str, probe: &Cache
             mod_id, record.jar_filename, record.modrinth_version_id
         ),
         CacheProbe::NotCached => format!(
-            "[Cache] '{mod_id}' has never been cached for this target and cache-only mode has no way to fetch it; the mod is skipped"
+            "[Cache] '{mod_id}' has never been cached for this target and this launch has no chosen version to fetch it with; the mod is skipped"
         ),
         CacheProbe::Ready(_) | CacheProbe::JarMissing(_) => return,
     };
