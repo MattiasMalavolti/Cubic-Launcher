@@ -1,6 +1,5 @@
 import { For, Show, createEffect, createSignal } from "solid-js";
-import { modIcons } from "../../store";
-import { cachedModName } from "../../app/backend-loaders";
+import { modIcons, modNames } from "../../store";
 import { AlertTriangleIcon, PackageIcon } from "../icons";
 import { Modal, ModalHeader } from "./modal-base";
 import type { ModUpdateRow } from "../../lib/types";
@@ -30,7 +29,7 @@ export function UpdatePopup(props: {
 
   const allAccepted = () => props.updates.length > 0 && accepted().size === props.updates.length;
   const someAccepted = () => accepted().size > 0;
-  const displayName = (row: ModUpdateRow) => cachedModName(row.projectId) ?? row.modId;
+  const displayName = (row: ModUpdateRow) => modNames().get(row.projectId) ?? row.modId;
   const iconUrl = (row: ModUpdateRow) => modIcons().get(row.projectId);
 
   const toggleRow = (modId: string, checked: boolean) => {

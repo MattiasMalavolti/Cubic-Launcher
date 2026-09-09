@@ -17,6 +17,7 @@ import type {
   ModListCard,
   ModrinthResult,
   ModRow,
+  UpdatePrecheckResult,
   VersionRule,
 } from "./lib/types";
 import { LAUNCH_STAGES } from "./lib/types";
@@ -63,6 +64,10 @@ export const [showSnapshots, setShowSnapshots] = createSignal(false);
 export const [selectedMcVersion, setSelectedMcVersion] = createSignal("1.21.1");
 export const [selectedModLoader, setSelectedModLoader] = createSignal<string>("Fabric");
 export const [launchState, setLaunchState] = createSignal<"idle" | "resolving" | "ready" | "running">("idle");
+/** True while `update_precheck_command` runs, i.e. between Play and the popup. */
+export const [updateCheckRunning, setUpdateCheckRunning] = createSignal(false);
+/** The pre-check payload the popup is showing; `null` means no popup. */
+export const [pendingUpdatePrecheck, setPendingUpdatePrecheck] = createSignal<UpdatePrecheckResult | null>(null);
 export const [launchProgress, setLaunchProgress] = createSignal(0);
 export const [launchStageLabel, setLaunchStageLabel] = createSignal(LAUNCH_STAGES[0].label);
 export const [launchStageDetail, setLaunchStageDetail] = createSignal(LAUNCH_STAGES[0].detail);
@@ -121,6 +126,8 @@ export const [createModlistBusy, setCreateModlistBusy] = createSignal(false);
 export const [localJarRuleName, setLocalJarRuleName] = createSignal("");
 export const [appLoading, setAppLoading] = createSignal(true);
 export const [modIcons, setModIcons] = createSignal<Map<string, string>>(new Map());
+/** Readable Modrinth names by project id/slug, filled by `fetchMetadataForIds`. */
+export const [modNames, setModNames] = createSignal<Map<string, string>>(new Map());
 export const [savedLinks, setSavedLinks] = createSignal<LinkRule[]>([]);
 export const [draftLinks, setDraftLinks] = createSignal<LinkRule[]>([]);
 export const [linkModalOpen, setLinkModalOpen] = createSignal(false);

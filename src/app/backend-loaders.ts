@@ -9,7 +9,7 @@ import {
   setAestheticGroups, setFunctionalGroups,
   setSavedIncompatibilities, setSavedLinks,
   setInstancePresentation,
-  setModIcons, modIcons,
+  setModIcons, modIcons, setModNames, modNames,
   minecraftVersions, setSelectedMcVersion, setSelectedModLoader, selectedMcVersion, selectedModLoader,
   setVersionRules, setCustomConfigs,
   setResolvedModIds, setResolvedTarget, setExpandedRows,
@@ -20,7 +20,6 @@ export const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS
 
 let resolutionSeq = 0;
 export const modlistVersionLoaderCache = new Map<string, { version: string; loader: string }>();
-const modNameCache = new Map<string, string>();
 
 export async function runResolution(modlistName?: string, mcVersion?: string, modLoader?: string) {
   const name = modlistName ?? selectedModListName();
@@ -369,9 +368,23 @@ function collectModrinthIds(rows: ModRow[]): Set<string> {
 export async function fetchModMetadata(rows: ModRow[]) {
   const ids = [...collectModrinthIds(rows)];
   if (ids.length === 0) return;
-
+  // Only this entry point holds `ModRow`s, so only this one patches their
+  // names: before, for names already cached, and after the request.
   patchModNames();
+  await fetchMetadataForIds(ids);
+  patchModNames();
+}
 
+/**
+ * Fill `modIcons` and `modNames` for these Modrinth project ids (or slugs) with
+ * **one** request for the ones not already known.
+ *
+ * Id-driven because not every caller holds `ModRow`s: the update popup's rows
+ * name a `projectId` and nothing else. It writes the two signals and nothing
+ * else — no `modRowsState` rewrite on a path that has nothing to do with the
+ * mod list — and whoever needs the rows patched does it itself.
+ */
+export async function fetchMetadataForIds(ids: string[]) {
   const missing = ids.filter(id => !modIcons().has(id));
   if (missing.length === 0) return;
 
@@ -384,27 +397,28 @@ export async function fetchModMetadata(rows: ModRow[]) {
     if (!response.ok) return;
     const projects: Array<{ id: string; slug: string; title: string; icon_url?: string | null }> = await response.json();
     const updatedIcons = new Map(modIcons());
+    const updatedNames = new Map(modNames());
     for (const project of projects) {
       if (project.icon_url) {
         if (project.id) updatedIcons.set(project.id, project.icon_url);
         if (project.slug) updatedIcons.set(project.slug, project.icon_url);
       }
       if (project.title) {
-        if (project.id) modNameCache.set(project.id, project.title);
-        if (project.slug) modNameCache.set(project.slug, project.title);
+        if (project.id) updatedNames.set(project.id, project.title);
+        if (project.slug) updatedNames.set(project.slug, project.title);
       }
     }
     setModIcons(updatedIcons);
-    patchModNames();
+    setModNames(updatedNames);
   } catch {
       // metadata is best-effort
   }
 }
 
 function patchModNames() {
-  if (modNameCache.size === 0) return;
+  if (modNames().size === 0) return;
   setModRowsState(current => current.map(function patch(row: ModRow): ModRow {
-    const realName = row.modrinth_id ? modNameCache.get(row.modrinth_id) : undefined;
+    const realName = row.modrinth_id ? modNames().get(row.modrinth_id) : undefined;
     const needsPatch = realName && (row.name === row.modrinth_id || row.name === row.primaryModId);
     const nameFixed = needsPatch ? { ...row, name: realName } : row;
     if (nameFixed.alternatives?.length) {
@@ -422,15 +436,6 @@ function patchModNames() {
  */
 export function seedModName(id: string, name: string) {
   if (!id || !name || name === id) return;
-  modNameCache.set(id, name);
+  setModNames(current => new Map(current).set(id, name));
   patchModNames();
-}
-
-/**
- * The readable name `fetchModMetadata` cached for a Modrinth project id, for
- * callers that hold an id and no `ModRow` — the update popup's rows name a
- * `projectId` and nothing else.
- */
-export function cachedModName(id: string): string | undefined {
-  return modNameCache.get(id);
 }
