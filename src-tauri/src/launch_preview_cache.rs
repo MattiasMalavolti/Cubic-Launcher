@@ -116,6 +116,22 @@ pub(super) fn probe_cached_mod_for_target(
     repository.probe_project(project_id, target)
 }
 
+/// Same, for the one version id a pre-check named.
+pub(super) fn probe_cached_version_for_target(
+    launcher_paths: &LauncherPaths,
+    version_id: &str,
+    target: &ResolutionTarget,
+) -> Result<CacheProbe> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
+    repository.probe_version(version_id, target)
+}
+
 /// One cache column per selected Modrinth mod, on this target, keyed by the mod
 /// id used in the rules.
 ///

@@ -283,7 +283,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         .as_ref()
         .filter(|versions| !versions.is_empty());
     let selection = if effective_settings.cache_only_mode {
-        resolve_cache_only_selection(&launcher_paths, &modlist, &target)?
+        resolve_cache_only_selection(&launcher_paths, &modlist, &target, preresolved_versions)?
     } else {
         resolve_online_selection(
             &app_handle,
@@ -335,8 +335,24 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             &app_handle,
             &launcher_paths,
             &selected_mods,
+            &modrinth_client,
             &target,
-        )?;
+            preresolved_versions,
+        )
+        .await?;
+        // The rows for the versions fetched here are written at the end of the
+        // launch under their canonical project id; without the alias a rule
+        // that names a slug would stop finding them on the next launch. Same
+        // list the online branch builds, for the same reason.
+        let project_aliases = parent_artifacts
+            .iter()
+            .filter_map(|(mod_id, artifact)| match artifact {
+                RemoteArtifact::Live(version) => {
+                    Some((mod_id.clone(), version.project_id.clone()))
+                }
+                RemoteArtifact::Cached(_) | RemoteArtifact::MissingJar(_) => None,
+            })
+            .collect::<Vec<_>>();
         let parent_artifact_values = parent_artifacts.into_values().collect::<Vec<_>>();
         let split = split_remote_artifacts(&parent_artifact_values);
         let parent_versions = split.live_versions;
@@ -361,7 +377,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             split.missing_jar_records,
             DependencyResolution::default(),
             required_java_version_for_minecraft(&target.minecraft_version)?,
-            Vec::new(),
+            project_aliases,
         )
     } else {
         // DESIGN: deliberately a second pass, not a reuse of the one inside

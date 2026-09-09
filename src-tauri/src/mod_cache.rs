@@ -602,6 +602,23 @@ impl<'connection> SqliteModCacheRepository<'connection> {
             None => Ok(CacheProbe::NotCached),
         }
     }
+
+    /// Same three answers for one exact version id — the version a pre-check
+    /// handed down, which must not be traded for another one.
+    pub fn probe_version(
+        &self,
+        version_id: &str,
+        target: &ResolutionTarget,
+    ) -> Result<CacheProbe> {
+        if let Some(record) = self.find_by_version_id(version_id, target)? {
+            return Ok(CacheProbe::Ready(record));
+        }
+
+        match self.find_registered_by_version_id(version_id, target)? {
+            Some(record) => Ok(classify_missing_jar(record)),
+            None => Ok(CacheProbe::NotCached),
+        }
+    }
 }
 
 impl ModCacheLookup for SqliteModCacheRepository<'_> {
@@ -1354,6 +1371,50 @@ mod tests {
                 .probe_project("sodium", &target())
                 .expect("probe should succeed"),
             CacheProbe::Ready(registered)
+        );
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn probing_a_version_id_answers_for_that_version_only() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        let older = repository
+            .upsert_modrinth_version(&version("sodium", "version-1", "sodium-1.jar"), &target())
+            .expect("older record should insert");
+        let newer = repository
+            .upsert_modrinth_version(&version("sodium", "version-2", "sodium-2.jar"), &target())
+            .expect("newer record should insert");
+        write_jar_for(&mods_cache_dir, &older);
+
+        assert_eq!(
+            repository
+                .probe_version("version-1", &target())
+                .expect("probe should succeed"),
+            CacheProbe::Ready(older)
+        );
+        // The row for the version that was asked for, not the one whose jar
+        // happens to be there.
+        assert_eq!(
+            repository
+                .probe_version("version-2", &target())
+                .expect("probe should succeed"),
+            CacheProbe::JarMissing(newer)
+        );
+        assert_eq!(
+            repository
+                .probe_version("version-never-seen", &target())
+                .expect("probe should succeed"),
+            CacheProbe::NotCached
         );
 
         drop(connection);
