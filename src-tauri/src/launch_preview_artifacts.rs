@@ -18,9 +18,10 @@ use crate::resolver::{
 use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
 
 use super::{
-    embedded_minecraft_requirements_match, emit_log, ensure_remote_version_cached,
-    load_cached_file_hashes_for_selected, probe_cached_mod_for_target,
-    probe_cached_version_for_target, read_embedded_fabric_requirements, SelectedMod,
+    embedded_minecraft_requirements_match, emit_launcher_issue, emit_log,
+    ensure_remote_version_cached, load_cached_file_hashes_for_selected,
+    probe_cached_mod_for_target, probe_cached_version_for_target,
+    read_embedded_fabric_requirements, SelectedMod,
 };
 
 pub(super) struct TopLevelVersionCandidates {
@@ -716,6 +717,7 @@ pub(super) fn resolve_cache_fallback_artifacts(
     let probes = probe_selected_mods(launcher_paths, selected_mods, target)?;
     let fallback = cached_artifacts_for_unresolved(&probes, resolved);
 
+    let mut restored = 0usize;
     for (mod_id, artifact) in &fallback {
         // "No version came back" covers both a Modrinth that has none for this
         // target and a lookup that failed: the resolving pass reports the two
@@ -725,18 +727,36 @@ pub(super) fn resolve_cache_fallback_artifacts(
                 "[Cache] no version came back from Modrinth for '{}' on this target; installing the cached jar {} (version {})",
                 mod_id, record.jar_filename, record.modrinth_version_id
             ),
-            RemoteArtifact::MissingJar(record) => format!(
-                "[Cache] no version came back from Modrinth for '{}' on this target and its cached jar is gone ({}); restoring the registered version {}",
-                mod_id, record.jar_filename, record.modrinth_version_id
-            ),
+            RemoteArtifact::MissingJar(record) => {
+                restored += 1;
+                report_restored_jar(app_handle, mod_id, record);
+                continue;
+            }
             RemoteArtifact::Live(_) => continue,
         };
         let _ = emit_log(app_handle, ProcessLogStream::Stderr, message);
     }
 
+    // One notice for the whole fallback, not one per mod: with Modrinth
+    // unreachable this is the entire mod-list, and twenty-five banners say
+    // less than one.
+    let from_cache = fallback.len() - restored;
+    if from_cache > 0 {
+        let _ = emit_launcher_issue(
+            app_handle,
+            "Launching from your cached versions",
+            &format!(
+                "{from_cache} mod(s) got no version from Modrinth for this target and are installed from the jars you already have."
+            ),
+            "Modrinth either has no compatible version for them or did not answer. The launch continues with the cached versions.",
+            "warning",
+            "launch",
+        );
+    }
+
     for (mod_id, probe) in &probes {
         if !resolved.contains_key(mod_id) {
-            log_unusable_probe(app_handle, mod_id, probe);
+            report_unusable_probe(app_handle, mod_id, probe);
         }
     }
 
@@ -748,26 +768,80 @@ pub(super) fn resolve_cache_fallback_artifacts(
     Ok(split_remote_artifacts(&artifacts))
 }
 
-/// A mod the cache cannot serve and nothing can restore, with the reason.
-/// Both selection passes treat it as unavailable — today's behaviour — and the
-/// launch names it once instead of dropping it in silence.
-fn log_unusable_probe(app_handle: &tauri::AppHandle, mod_id: &str, probe: &CacheProbe) {
-    let message = match probe {
-        CacheProbe::JarMissingUnrecoverable(record) if record.is_local => format!(
-            "[Cache] the cached jar of local mod '{}' is gone ({}); a locally copied jar has no Modrinth download url, so it cannot be restored and the mod is skipped",
-            mod_id, record.jar_filename
-        ),
-        CacheProbe::JarMissingUnrecoverable(record) => format!(
-            "[Cache] the cached jar of '{}' is gone ({}, version {}) and its cache row has no download url, so it cannot be restored and the mod is skipped",
+/// A registered version whose jar left the cache directory, said twice: in the
+/// launch log and on the banner (D28). The launch keeps working — the row
+/// carries the url and the hash — but the user is the only one who knows
+/// whether a jar disappearing is normal on their machine.
+fn report_restored_jar(app_handle: &tauri::AppHandle, mod_id: &str, record: &ModCacheRecord) {
+    let _ = emit_log(
+        app_handle,
+        ProcessLogStream::Stderr,
+        format!(
+            "[Cache] the cached jar of '{}' is gone ({}); re-downloading the registered version {} instead of the newest one",
             mod_id, record.jar_filename, record.modrinth_version_id
         ),
-        CacheProbe::NotCached => format!(
-            "[Cache] '{mod_id}' has never been cached for this target and this launch has no chosen version to fetch it with; the mod is skipped"
+    );
+    let _ = emit_launcher_issue(
+        app_handle,
+        "Cached jar restored",
+        &format!(
+            "The jar of '{mod_id}' had left the cache directory; the launch re-downloaded the version you had."
+        ),
+        &format!(
+            "{} (version {}) was missing from the cache directory and was restored from its cache row, not replaced by the newest version.",
+            record.jar_filename, record.modrinth_version_id
+        ),
+        "warning",
+        "launch",
+    );
+}
+
+/// A mod the cache cannot serve and nothing can restore, with the reason.
+///
+/// Both selection passes treat it as unavailable — today's behaviour — and
+/// this is the one case where the mod is **not** in the game: the log names it
+/// and the banner says so, because a mod missing in silence is the worst
+/// failure this pipeline has.
+fn report_unusable_probe(app_handle: &tauri::AppHandle, mod_id: &str, probe: &CacheProbe) {
+    let (message, detail) = match probe {
+        CacheProbe::JarMissingUnrecoverable(record) if record.is_local => (
+            format!(
+                "[Cache] the cached jar of local mod '{}' is gone ({}); a locally copied jar has no Modrinth download url, so it cannot be restored and the mod is skipped",
+                mod_id, record.jar_filename
+            ),
+            format!(
+                "{} was copied in by hand, so there is no download url to restore it from. Add the jar again to get the mod back.",
+                record.jar_filename
+            ),
+        ),
+        CacheProbe::JarMissingUnrecoverable(record) => (
+            format!(
+                "[Cache] the cached jar of '{}' is gone ({}, version {}) and its cache row has no download url, so it cannot be restored and the mod is skipped",
+                mod_id, record.jar_filename, record.modrinth_version_id
+            ),
+            format!(
+                "{} (version {}) is missing and its cache row has no download url.",
+                record.jar_filename, record.modrinth_version_id
+            ),
+        ),
+        CacheProbe::NotCached => (
+            format!(
+                "[Cache] '{mod_id}' has never been cached for this target and this launch has no chosen version to fetch it with; the mod is skipped"
+            ),
+            "The mod has never been downloaded for this Minecraft version and loader, and this launch had no chosen version to fetch it with.".to_string(),
         ),
         CacheProbe::Ready(_) | CacheProbe::JarMissing(_) => return,
     };
 
     let _ = emit_log(app_handle, ProcessLogStream::Stderr, message);
+    let _ = emit_launcher_issue(
+        app_handle,
+        "Mod left out of the launch",
+        &format!("'{mod_id}' is not in this launch: its jar is not in the cache and cannot be fetched."),
+        &detail,
+        "warning",
+        "launch",
+    );
 }
 
 /// What the launch installs for the selected mods when it may not choose
@@ -811,14 +885,7 @@ pub(super) async fn resolve_selected_remote_artifacts(
                 artifacts.insert(mod_id.clone(), RemoteArtifact::Cached(record));
             }
             NamedVersionPlan::RestoreRegistered(record) => {
-                let _ = emit_log(
-                    app_handle,
-                    ProcessLogStream::Stderr,
-                    format!(
-                        "[Cache] the cached jar of '{}' is gone ({}); restoring version {} from the cache row instead of resolving a new one",
-                        mod_id, record.jar_filename, record.modrinth_version_id
-                    ),
-                );
+                report_restored_jar(app_handle, mod_id, &record);
                 artifacts.insert(mod_id.clone(), RemoteArtifact::MissingJar(record));
             }
             NamedVersionPlan::FetchMetadata => {
@@ -910,17 +977,10 @@ pub(super) async fn resolve_selected_remote_artifacts(
                 artifacts.insert(mod_id.clone(), RemoteArtifact::Cached(record));
             }
             CacheProbe::JarMissing(record) => {
-                let _ = emit_log(
-                    app_handle,
-                    ProcessLogStream::Stderr,
-                    format!(
-                        "[Cache] the cached jar of '{}' is gone ({}); re-downloading the registered version {} instead of the newest one",
-                        mod_id, record.jar_filename, record.modrinth_version_id
-                    ),
-                );
+                report_restored_jar(app_handle, mod_id, &record);
                 artifacts.insert(mod_id.clone(), RemoteArtifact::MissingJar(record));
             }
-            other => log_unusable_probe(app_handle, mod_id, &other),
+            other => report_unusable_probe(app_handle, mod_id, &other),
         }
     }
 
