@@ -16,6 +16,7 @@ import {
   selectedModListName,
 } from "../../store";
 import { Modal, ModalHeader } from "./modal-base";
+import { ChevronDownIcon, ChevronRightIcon } from "../icons";
 const isTauriEnv = () => "__TAURI_INTERNALS__" in window;
 
 export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
@@ -65,6 +66,7 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
   const [globalDraft, setGlobalDraft] = createSignal<GlobalSettingsState>({ ...globalSettings() });
   const [modlistDraft, setModlistDraft] = createSignal<ModlistOverridesState>({ ...modlistOverrides() });
   const [lastUpdateCheck, setLastUpdateCheck] = createSignal<UpdateCheckResponse | null>(null);
+  const [notificationsAdvancedOpen, setNotificationsAdvancedOpen] = createSignal(false);
 
   createEffect(on(settingsModalOpen, open => {
     if (!open) return;
@@ -197,10 +199,35 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                 </div>
                 <div>
                   <label class="flex items-center gap-3 text-sm">
-                    <input type="checkbox" checked={globalDraft().cacheOnlyMode} onChange={e => setGlobalDraft(c => ({ ...c, cacheOnlyMode: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
-                    <span class="text-foreground">Cache-Only Mode</span>
+                    <input type="checkbox" checked={globalDraft().updateNotificationsEnabled} onChange={e => setGlobalDraft(c => ({ ...c, updateNotificationsEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+                    <span class="text-foreground">Notify me when updates are available</span>
                   </label>
-                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Prefer cached mod artifacts and stored dependency links before querying Modrinth. Useful for large packs and faster repeat launches.</p>
+                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Cubic Launcher always launches from the versions you have. When this is on, it checks Modrinth before launch and lets you choose what to update.</p>
+                  <div class="mt-2">
+                    <div class="flex items-center gap-2">
+                      <span class="flex-1 text-sm text-muted-foreground ml-7">Advanced</span>
+                      <button onClick={() => setNotificationsAdvancedOpen(value => !value)} class="text-muted-foreground hover:text-foreground transition-colors p-0.5" aria-label="Toggle advanced notification settings">
+                        <Show when={notificationsAdvancedOpen()} fallback={<ChevronRightIcon class="h-3.5 w-3.5" />}><ChevronDownIcon class="h-3.5 w-3.5" /></Show>
+                      </button>
+                    </div>
+                    <Show when={notificationsAdvancedOpen()}>
+                      <div class="ml-7 mt-1 space-y-1.5">
+                        <p class="text-xs text-muted-foreground">Mods are always included. These are the other categories to report on.</p>
+                        <label class="flex items-center gap-3 text-sm">
+                          <input type="checkbox" checked={globalDraft().updateNotificationsResourcePacks} onChange={e => setGlobalDraft(c => ({ ...c, updateNotificationsResourcePacks: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+                          <span class="text-foreground">Resource packs</span>
+                        </label>
+                        <label class="flex items-center gap-3 text-sm">
+                          <input type="checkbox" checked={globalDraft().updateNotificationsDataPacks} onChange={e => setGlobalDraft(c => ({ ...c, updateNotificationsDataPacks: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+                          <span class="text-foreground">Data packs</span>
+                        </label>
+                        <label class="flex items-center gap-3 text-sm">
+                          <input type="checkbox" checked={globalDraft().updateNotificationsShaders} onChange={e => setGlobalDraft(c => ({ ...c, updateNotificationsShaders: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+                          <span class="text-foreground">Shaders</span>
+                        </label>
+                      </div>
+                    </Show>
+                  </div>
                 </div>
               </div>
             </Show>

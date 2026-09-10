@@ -100,7 +100,13 @@ export async function loadShellSnapshot(preferredName?: string | null) {
         maxRamMb: gs.max_ram_mb ?? 4096,
         customJvmArgs: gs.custom_jvm_args ?? "",
         profilerEnabled: gs.profiler_enabled ?? false,
-        cacheOnlyMode: gs.cache_only_mode ?? false,
+        // The defaults match the backend's (`app_shell.rs`): a key the
+        // database does not have yet means notifications on, every category
+        // included.
+        updateNotificationsEnabled: gs.update_notifications_enabled ?? true,
+        updateNotificationsResourcePacks: gs.update_notifications_resource_packs ?? true,
+        updateNotificationsDataPacks: gs.update_notifications_data_packs ?? true,
+        updateNotificationsShaders: gs.update_notifications_shaders ?? true,
         wrapperCommand: gs.wrapper_command ?? "",
         javaPathOverride: gs.java_path_override ?? "",
       });

@@ -70,8 +70,22 @@ export function upsertDownloadProgress(update: { filename: string; progress: num
   });
 }
 
+// Ids have to be unique per notice, not per millisecond: a single launch can
+// push several notices inside the same tick (one per mod left out), and two
+// rows sharing an id make the banner dismiss both at once.
+let uiErrorSequence = 0;
+
 export function pushUiError(error: Omit<LauncherUiError, "id">) {
-  setLauncherErrors(current => [{ id: `ui-error-${Date.now()}`, ...error }, ...current.slice(0, 19)]);
+  uiErrorSequence += 1;
+  setLauncherErrors(current => [{ id: `ui-error-${Date.now()}-${uiErrorSequence}`, ...error }, ...current.slice(0, 19)]);
+}
+
+export function dismissUiError(id: string) {
+  setLauncherErrors(current => current.filter(error => error.id !== id));
+}
+
+export function dismissAllUiErrors() {
+  setLauncherErrors([]);
 }
 
 export function toggleExpanded(id: string) {

@@ -22,7 +22,7 @@ import {
   renameRuleDraft, renameRuleTargetId, setRenameRuleModalOpen,
   selectedIds, setSelectedIds, setExpandedRows, activeAccount, setAddModModalOpen,
   setSettingsModalOpen, localJarRuleName, setLocalJarRuleName,
-  setGlobalSettings, setModlistOverrides,
+  globalSettings, setGlobalSettings, setModlistOverrides,
   pushUiError, resetLaunchUiState,
   setAestheticGroups, setFunctionalGroups,
   setSavedIncompatibilities,
@@ -69,6 +69,7 @@ import { useAppBootstrap } from "./app/use-app-bootstrap";
 import { useAppPersistence } from "./app/persistence-effects";
 import { Header } from "./components/Header";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { NoticeBanner } from "./components/NoticeBanner";
 import { Sidebar } from "./components/Sidebar";
 import { ModListEditor } from "./components/ModListEditor";
 import { bumpContentVersion, seedContentName } from "./components/mod-list-editor/ContentTabView";
@@ -565,7 +566,10 @@ export default function App() {
           maxRamMb: globalDraft.maxRamMb,
           customJvmArgs: globalDraft.customJvmArgs,
           profilerEnabled: globalDraft.profilerEnabled,
-          cacheOnlyMode: globalDraft.cacheOnlyMode,
+          updateNotificationsEnabled: globalDraft.updateNotificationsEnabled,
+          updateNotificationsResourcePacks: globalDraft.updateNotificationsResourcePacks,
+          updateNotificationsDataPacks: globalDraft.updateNotificationsDataPacks,
+          updateNotificationsShaders: globalDraft.updateNotificationsShaders,
           wrapperCommand: globalDraft.wrapperCommand,
           javaPathOverride: globalDraft.javaPathOverride,
         },
@@ -866,6 +870,17 @@ export default function App() {
       // fills in when the single request lands.
       void fetchMetadataForIds(precheck.updates.map(update => update.projectId));
 
+      // D30: with notifications off the pre-check still ran — a mod that was
+      // never downloaded has to be resolved or it would never be installed —
+      // but nothing is shown and nothing is updated. `resolved` carries the
+      // **candidate** versions, so handing it over as it is would update
+      // every mod in silence, which is the opposite of what switching the
+      // notifications off asks for. An empty accepted set is the same code
+      // path as the popup's "Skip".
+      if (!globalSettings().updateNotificationsEnabled) {
+        await startLaunch(buildResolvedVersions(precheck.resolved, precheck.updates, new Set()));
+        return;
+      }
       if (precheck.updates.length === 0) {
         await startLaunch(precheck.resolved);
         return;
@@ -892,6 +907,7 @@ export default function App() {
       {/* Header - Fixed at top */}
       <Header />
       <UpdateBanner />
+      <NoticeBanner />
 
       {/* Main content area - Sidebar + Content + BottomBar */}
       <div class="flex flex-1 overflow-hidden relative">
