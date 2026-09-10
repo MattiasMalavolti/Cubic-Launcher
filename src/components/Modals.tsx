@@ -18,3 +18,5 @@ export {
   ErrorCenter,
   ExportModal,
 } from "./modals/modal-system";
+
+export { UpdatePopup } from "./modals/update-popup";

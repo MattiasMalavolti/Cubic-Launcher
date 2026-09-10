@@ -5,7 +5,7 @@
 // `src/app/`, `src/store-*`, or colocated component folders instead of growing
 // this file again.
 
-import { batch, onMount } from "solid-js";
+import { Show, batch, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { appendDebugTrace } from "./lib/debugTrace";
 import { logger } from "./lib/logger";
@@ -34,9 +34,11 @@ import {
   setAdvancedPanelModId, rowMap, setOnToggleEnabled,
   launchState, selectedModList,
   setUpdateInfo,
+  updateCheckRunning, setUpdateCheckRunning, pendingUpdatePrecheck, setPendingUpdatePrecheck,
   LAUNCH_STAGES, wait,
 } from "./store";
-import { normalizeModLoader, type ModRow } from "./lib/types";
+import { normalizeModLoader, type ModRow, type UpdatePrecheckResult } from "./lib/types";
+import { buildResolvedVersions } from "./lib/update-selection";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "./store";
 import {
   buildIdRemap,
@@ -52,6 +54,7 @@ import {
 } from "./app/row-state";
 import {
   fetchModMetadata,
+  fetchMetadataForIds,
   seedModName,
   isTauri,
   loadAllCardIcons,
@@ -84,6 +87,7 @@ import {
   AlternativesPanel,
   ErrorCenter,
   ExportModal,
+  UpdatePopup,
 } from "./components/Modals";
 import { AdvancedModPanel } from "./components/AdvancedModPanel";
 
@@ -807,8 +811,25 @@ export default function App() {
     }
   };
 
+  const startLaunch = async (resolvedVersions?: Record<string, string>) => {
+    try {
+      await invoke("start_launch_command", {
+        request: {
+          modlistName: selectedModListName(),
+          minecraftVersion: selectedMcVersion(),
+          modLoader: normalizeModLoader(selectedModLoader()),
+          // Omitted, not `undefined`: a request without the field is the
+          // pre-feature request, and the backend reads its absence (D19).
+          ...(resolvedVersions ? { resolvedVersions } : {}),
+        },
+      });
+    } catch (err) {
+      pushUiError({ title: "Launch failed", message: "The backend could not start the launch.", detail: String(err), severity: "error", scope: "launch" });
+    }
+  };
+
   const handleLaunch = async () => {
-    if (launchState() === "resolving" || launchState() === "running") return;
+    if (launchState() === "resolving" || launchState() === "running" || updateCheckRunning()) return;
     if (!selectedModList()) {
       pushUiError({ title: "No mod list selected", message: "Select a mod list from the sidebar before launching.", detail: "", severity: "warning", scope: "launch" });
       return;
@@ -816,19 +837,41 @@ export default function App() {
     resetLaunchUiState();
 
     if (isTauri()) {
+      // The pre-check runs before every launch: making it conditional on a
+      // setting is A3. Two commands instead of one widen the double-click
+      // window, hence the guard above and the disabled Play button.
+      setUpdateCheckRunning(true);
+      let precheck: UpdatePrecheckResult;
       try {
-        await invoke("start_launch_command", {
+        precheck = await invoke<UpdatePrecheckResult>("update_precheck_command", {
           request: {
             modlistName: selectedModListName(),
             minecraftVersion: selectedMcVersion(),
             modLoader: normalizeModLoader(selectedModLoader()),
           },
         });
-        return; // backend drives the progress via events
       } catch (err) {
-        pushUiError({ title: "Launch failed", message: "The backend could not start the launch.", detail: String(err), severity: "error", scope: "launch" });
+        // D19: an update check must never be the reason the game does not
+        // start. No map means the launch picks versions exactly as it did
+        // before this feature existed.
+        pushUiError({ title: "Update check failed", message: "Launching with the versions already in your cache.", detail: String(err), severity: "warning", scope: "launch" });
+        setLaunchLogs(current => [...current, `[Launcher] WARN update check failed, launching from the cached versions — ${String(err)}`]);
+        await startLaunch();
+        return;
+      } finally {
+        setUpdateCheckRunning(false);
+      }
+
+      // Icons and names are best-effort and reactive: the popup opens now and
+      // fills in when the single request lands.
+      void fetchMetadataForIds(precheck.updates.map(update => update.projectId));
+
+      if (precheck.updates.length === 0) {
+        await startLaunch(precheck.resolved);
         return;
       }
+      setPendingUpdatePrecheck(precheck);
+      return; // the popup decides, then launches
     }
 
     // Browser simulation (fallback when not in Tauri)
@@ -905,6 +948,21 @@ export default function App() {
       <AlternativesPanel onSave={handleSaveAlternativeOrder} onAddAlternative={handleAddAlternative} onRemoveAlternative={handleRemoveAlternative} />
       <ErrorCenter />
       <ExportModal onExport={handleExport} />
+      <Show when={pendingUpdatePrecheck()} keyed>
+        {precheck => (
+          <UpdatePopup
+            updates={precheck.updates}
+            versionNumberLookupError={precheck.versionNumberLookupError}
+            onChoose={accepted => {
+              setPendingUpdatePrecheck(null);
+              void startLaunch(buildResolvedVersions(precheck.resolved, precheck.updates, accepted));
+            }}
+            // D26: the X and the backdrop cancel the launch. "Skip" means
+            // "launch without updating"; closing means "I have not decided".
+            onCancel={() => setPendingUpdatePrecheck(null)}
+          />
+        )}
+      </Show>
     </div>
   );
 }

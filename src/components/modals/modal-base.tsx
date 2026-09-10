@@ -1,4 +1,4 @@
-import { Show } from "solid-js";
+import { Show, type JSX } from "solid-js";
 import { XIcon } from "../icons";
 
 export function Modal(props: { children: any; onClose: () => void; maxWidth?: string }) {
@@ -14,7 +14,7 @@ export function Modal(props: { children: any; onClose: () => void; maxWidth?: st
   );
 }
 
-export function ModalHeader(props: { title: string; description?: string; onClose: () => void }) {
+export function ModalHeader(props: { title: string; description?: string; onClose: () => void; actions?: JSX.Element }) {
   return (
     <div class="flex items-center justify-between border-b border-border px-6 py-4">
       <div>
@@ -23,9 +23,12 @@ export function ModalHeader(props: { title: string; description?: string; onClos
           <p class="text-sm text-muted-foreground">{props.description}</p>
         </Show>
       </div>
-      <button onClick={props.onClose} class="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
-        <XIcon class="h-4 w-4" />
-      </button>
+      <div class="flex items-center gap-4">
+        <Show when={props.actions}>{props.actions}</Show>
+        <button onClick={props.onClose} class="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+          <XIcon class="h-4 w-4" />
+        </button>
+      </div>
     </div>
   );
 }
