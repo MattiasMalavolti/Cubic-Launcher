@@ -358,32 +358,6 @@ impl ModrinthClient {
             .collect())
     }
 
-    pub async fn fetch_version(&self, version_id: &str) -> Result<Option<ModrinthVersion>> {
-        if version_id.trim().is_empty() {
-            bail!("version_id cannot be empty");
-        }
-
-        let url = build_version_url(&self.base_url, version_id)?;
-        let response = send_with_retry(|| self.http_client.get(url.clone()))
-            .await
-            .with_context(|| format!("failed to query Modrinth version '{version_id}'"))?;
-
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-
-        let response = response.error_for_status().with_context(|| {
-            format!("Modrinth returned an error for version '{version_id}' lookup")
-        })?;
-
-        let version = response
-            .json::<ModrinthVersion>()
-            .await
-            .with_context(|| format!("failed to deserialize Modrinth version '{version_id}'"))?;
-
-        Ok(Some(version))
-    }
-
     /// Version metadata for a set of version ids, in **one** request instead of
     /// one `GET /version/{id}` per mod.
     ///
@@ -571,11 +545,12 @@ pub struct ModrinthFile {
     pub size: u64,
 }
 
-/// An unrecognized `dependency_type` maps to `Unknown` instead of failing the
-/// deserialization. With one request per project a rejected payload cost one
-/// mod; with a single bulk request it would cost the whole modlist. `Unknown`
-/// is treated like any non-`Required` type by the dependency notices
-/// (`launch_preview_dependencies.rs:224`, `:331`).
+/// Declared dependencies are deserialized but nothing in the launcher reads
+/// them: dependencies are the user's to manage. The field stays declared so a
+/// payload carrying it keeps deserializing, and an unrecognized
+/// `dependency_type` maps to `Unknown` instead of failing the whole response —
+/// with a single bulk request a rejected payload would cost the entire modlist,
+/// not one mod.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize)]
 #[serde(from = "String")]
 pub enum DependencyType {

@@ -33,7 +33,7 @@ Cubic Launcher is a local-first, rule-based Minecraft launcher and modlist manag
 
 For each explicitly selected Modrinth project, Cubic Launcher chooses the latest release tagged for the exact Minecraft version in play. Only content represented by the selected rules is acquired.
 
-Dependencies remain user-managed. The launch pipeline inspects required-dependency declarations from Modrinth metadata and Fabric metadata embedded in cached JARs. Missing projects and unsatisfied version declarations become non-blocking informational notices. Those declarations do not trigger downloads, pin versions, or exclude the requiring mod.
+Dependencies are the user's to manage, and the launcher does not look at them. Required-dependency declarations in Modrinth metadata and in the `fabric.mod.json` embedded in a JAR are not inspected, not reported, and never trigger a download, a version pin, or the exclusion of the requiring mod. A dependency that is genuinely missing surfaces where it is known exactly: in the Minecraft client at startup.
 
 ## Modlist data model
 
@@ -78,7 +78,6 @@ The Rust backend is the source of truth for durable state and system operations:
 - `rules.rs` defines and validates the modlist rule format.
 - `resolver.rs` evaluates rules for a Minecraft/loader target.
 - `modrinth.rs` queries Modrinth and selects target-compatible versions.
-- `launch_preview_dependencies.rs` detects declared-dependency mismatches and emits notices without managing dependency artifacts.
 - `mod_cache.rs`, `launch_preview_cache.rs`, and `database.rs` manage cached artifacts and SQLite state.
 - `modlist_manager.rs` creates and imports modlists and copies user-selected local JARs.
 - `modlist_assets.rs` manages presentation data, editor groups, zip export, and instance-file browsing.
@@ -93,7 +92,7 @@ At a high level, the backend:
 
 1. Loads the shell snapshot and combines global settings with per-modlist overrides.
 2. Evaluates explicit rules and alternatives for the requested Minecraft version and loader.
-3. Chooses target-tagged versions for the selected remote projects, checks the cache, and emits dependency notices.
+3. Chooses target-tagged versions for the selected remote projects and checks the cache.
 4. Downloads missing artifacts for that selected content plus the required Minecraft, loader, and content-pack assets.
 5. Prepares the target-specific instance directories, mods, configs, libraries, natives, and launch metadata.
 6. Selects or downloads a suitable Java runtime, refreshes the Minecraft session when possible, and builds the JVM command with memory settings, custom arguments, profiler, and optional wrapper.
@@ -141,7 +140,7 @@ The local SQLite database is `launcher_data.db`. `database.rs` initializes and m
 - `java_installations` — discovered or user-provided Java runtimes with major version and architecture
 - `mod_cache` — cached remote or local artifact metadata keyed by Modrinth version and launch target
 - `modrinth_project_aliases` — slug-to-canonical-project-ID mappings used by cache lookups
-- `dependencies` — legacy dependency-link metadata; current notice-only dependency handling does not use it to acquire artifacts
+- `dependencies` — unused legacy dependency-link table; nothing writes it and nothing reads it
 - `config_attribution` — generated config paths linked to their originating JARs
 - `global_settings` — launcher-wide settings
 - `modlist_settings` — per-modlist overrides

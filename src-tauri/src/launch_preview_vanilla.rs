@@ -1,9 +1,7 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::dependencies::DependencyResolution;
 use crate::instance_mods::{prepare_instance_mods_directory, CachedModJar};
 use crate::java_runtime::required_java_version_for_minecraft;
 use crate::launch_command::{build_launch_command, JavaLaunchRequest, JavaLaunchSettings};
@@ -38,11 +36,6 @@ pub(super) async fn run_vanilla_launch_pipeline(
     )?;
 
     let selected_mods: Vec<SelectedMod> = Vec::new();
-    let dependency_resolution = DependencyResolution {
-        resolved_dependencies: Vec::new(),
-        links: Vec::new(),
-        excluded_parents: HashSet::new(),
-    };
     let acquisition_plan = ModAcquisitionPlan {
         cached: Vec::new(),
         to_download: Vec::new(),
@@ -50,7 +43,6 @@ pub(super) async fn run_vanilla_launch_pipeline(
     let cached_mod_jars = Vec::<CachedModJar>::new();
 
     launch_log_session.write_selected_mods(&selected_mods)?;
-    launch_log_session.write_dependency_summary(&dependency_resolution)?;
     launch_log_session.write_resolved_versions(&[], &[], &[])?;
     launch_log_session.write_cache_plan(&acquisition_plan)?;
     launch_log_session.write_final_mod_set(&cached_mod_jars)?;

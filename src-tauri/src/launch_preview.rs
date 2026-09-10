@@ -4,12 +4,11 @@ use tauri::State;
 // Launch orchestration entry point.
 //
 // The sibling `launch_preview_*` files are focused slices of the launch
-// pipeline: cache handling, dependency resolution, loader metadata, logging,
+// pipeline: cache handling, loader metadata, logging,
 // runtime setup, and verification. Keeping this file as the command-facing
 // orchestrator makes launch behavior easier to audit without returning to one
 // very large mixed-responsibility file.
 use crate::app_shell::load_shell_snapshot_from_root;
-use crate::dependencies::DependencyResolution;
 use crate::instance_configs::{prepare_instance_config_directory, CachedConfigPlacement};
 use crate::instance_mods::prepare_instance_mods_directory;
 use crate::java_runtime::required_java_version_for_minecraft;
@@ -31,10 +30,6 @@ use fabric::*;
 #[path = "launch_preview_fabric_versions.rs"]
 mod fabric_versions;
 use fabric_versions::*;
-
-#[path = "launch_preview_dependencies.rs"]
-mod dependencies;
-use dependencies::*;
 
 #[path = "launch_preview_artifacts.rs"]
 mod artifacts;
@@ -327,7 +322,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         all_remote_versions,
         cached_remote_records,
         missing_jar_records,
-        dependency_resolution,
         effective_required_java,
         project_aliases,
     ) = if let LaunchResolutionPath::Preresolved(preresolved) = resolution_path {
@@ -366,25 +360,15 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         let split = split_remote_artifacts(&parent_artifact_values);
         let parent_versions = split.live_versions;
 
-        // DESIGN: the launcher does not manage dependencies. Detect & report the
-        // requirements the selected mods DECLARE (best-effort over the live
-        // parent versions; cached-only records carry no dep metadata offline),
-        // then download ONLY what the user selected.
-        let notices = detect_dependency_notices(
-            &launcher_paths,
-            &http_client,
-            &modrinth_client,
-            &target,
-            &parent_versions,
-        )
-        .await;
-        emit_dependency_notices(&app_handle, &notices)?;
+        // DESIGN: the launcher does not manage dependencies. It downloads ONLY
+        // what the user selected; a dependency the user did not add is the
+        // user's call, and the Minecraft client says so at startup if it is
+        // really needed.
 
         (
             parent_versions,
             split.cached_records,
             split.missing_jar_records,
-            DependencyResolution::default(),
             required_java_version_for_minecraft(&target.minecraft_version)?,
             project_aliases,
         )
@@ -454,29 +438,17 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
 
         // DESIGN: no auto-resolution, no pinning, no parent exclusion, no
         // constraint-solving. Each selected mod is the latest exact-tagged
-        // version, independent of what the others declare. We DETECT declared
-        // requirements (Modrinth metadata incl. version_id pins + embedded
-        // fabric.mod.json predicates) and REPORT them; the user decides.
-        let notices = detect_dependency_notices(
-            &launcher_paths,
-            &http_client,
-            &modrinth_client,
-            &target,
-            &parent_versions,
-        )
-        .await;
-        emit_dependency_notices(&app_handle, &notices)?;
+        // version, independent of what the others declare. What a mod declares
+        // it needs is not inspected: dependencies are the user's to manage.
 
         (
             parent_versions,
             fallback.cached_records,
             fallback.missing_jar_records,
-            DependencyResolution::default(),
             required_java_version_for_minecraft(&target.minecraft_version)?,
             project_aliases,
         )
     };
-    launch_log_session.write_dependency_summary(&dependency_resolution)?;
     launch_log_session.write_resolved_versions(
         &all_remote_versions,
         &cached_remote_records,
@@ -548,11 +520,10 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             .collect::<Vec<_>>(),
     )
     .await?;
-    persist_remote_versions_and_dependencies(
+    persist_remote_versions_and_aliases(
         &launcher_paths,
         &all_remote_versions,
         &target,
-        &dependency_resolution.links,
         &project_aliases,
     )?;
 

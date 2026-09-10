@@ -7,7 +7,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use tauri::Emitter;
 
-use crate::dependencies::DependencyResolution;
 use crate::instance_mods::CachedModJar;
 use crate::launcher_paths::LauncherPaths;
 use crate::mod_cache::{ModAcquisitionPlan, ModCacheRecord};
@@ -138,52 +137,6 @@ impl LaunchLogSession {
             ));
         }
         self.write_file("selected_mods.log", &lines)
-    }
-
-    pub(super) fn write_dependency_summary(&self, resolution: &DependencyResolution) -> Result<()> {
-        let mut lines = vec![
-            format!(
-                "resolved_dependencies={}",
-                resolution.resolved_dependencies.len()
-            ),
-            format!("links={}", resolution.links.len()),
-            format!("excluded_parents={}", resolution.excluded_parents.len()),
-            String::new(),
-            "[resolved_dependencies]".to_string(),
-        ];
-
-        for dependency in &resolution.resolved_dependencies {
-            lines.push(format!(
-                "{} | version_id={} | jar={}",
-                dependency.dependency_id, dependency.version_id, dependency.jar_filename
-            ));
-        }
-
-        lines.push(String::new());
-        lines.push("[links]".to_string());
-        for link in &resolution.links {
-            lines.push(format!(
-                "{} -> {} | specific_version={} | jar={}",
-                link.parent_mod_id,
-                link.dependency_id,
-                link.specific_version.as_deref().unwrap_or("-"),
-                link.jar_filename
-            ));
-        }
-
-        lines.push(String::new());
-        lines.push("[excluded_parents]".to_string());
-        let mut excluded = resolution
-            .excluded_parents
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        excluded.sort();
-        for parent in excluded {
-            lines.push(parent);
-        }
-
-        self.write_file("dependencies.log", &lines)
     }
 
     /// `restored_records` are cache rows whose jar is gone and that the launch
@@ -527,8 +480,6 @@ fn launcher_category_file(line: &str) -> Option<&'static str> {
         Some("resolver.log")
     } else if line.starts_with("[Cache]") {
         Some("cache.log")
-    } else if line.starts_with("[Dependencies]") {
-        Some("dependencies.log")
     } else {
         None
     }

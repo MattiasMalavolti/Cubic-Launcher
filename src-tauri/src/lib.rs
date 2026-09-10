@@ -7,7 +7,6 @@ pub mod config_attribution;
 pub mod content_packs;
 mod database;
 pub mod debug_trace;
-pub mod dependencies;
 pub mod editor_data;
 pub mod instance_configs;
 pub mod instance_mods;
