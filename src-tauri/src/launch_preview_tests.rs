@@ -18,7 +18,8 @@ use super::{
     relative_loader_library_path, substitute_known_placeholders, validate_content_filename,
     validate_final_fabric_runtime, DependencyNoticeKind, EffectiveLaunchSettings,
     EmbeddedFabricModMetadata, EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
-    FabricValidationIssue, LaunchPlaceholders, LaunchRequest, LaunchVerificationRequest,
+    FabricValidationIssue, LaunchPlaceholders, LaunchRequest, LaunchResolutionPath,
+    LaunchVerificationRequest,
     LaunchVerificationResult,
     OwnedEmbeddedFabricModMetadata, PlayerIdentity,
 };
@@ -87,7 +88,10 @@ fn global_settings() -> ShellGlobalSettings {
         max_ram_mb: 4096,
         custom_jvm_args: "-Dglobal=true".into(),
         profiler_enabled: false,
-        cache_only_mode: true,
+        update_notifications_enabled: true,
+        update_notifications_resource_packs: true,
+        update_notifications_data_packs: true,
+        update_notifications_shaders: true,
         wrapper_command: "gamemoderun".into(),
         java_path_override: "/custom/java".into(),
     }
@@ -122,11 +126,42 @@ fn effective_launch_settings_prefer_modlist_overrides() {
     assert_eq!(settings.min_ram_mb, 8192);
     assert_eq!(settings.max_ram_mb, 4096);
     assert_eq!(settings.custom_jvm_args, "-Dmodlist=true");
-    assert!(settings.cache_only_mode);
     assert_eq!(settings.wrapper_command, Some("mangohud".into()));
     assert_eq!(
         settings.java_path_override,
         Some(PathBuf::from("/custom/java"))
+    );
+}
+
+#[test]
+fn a_version_map_sends_the_launch_down_the_preresolved_path() {
+    let map = HashMap::from([("sodium".to_string(), "abc123".to_string())]);
+
+    assert_eq!(
+        LaunchResolutionPath::for_launch(Some(&map)),
+        LaunchResolutionPath::Preresolved(&map)
+    );
+}
+
+#[test]
+fn no_version_map_keeps_the_resolving_path() {
+    assert_eq!(
+        LaunchResolutionPath::for_launch(None),
+        LaunchResolutionPath::Resolve
+    );
+}
+
+#[test]
+fn an_empty_version_map_is_not_a_decision() {
+    let empty = HashMap::new();
+
+    assert_eq!(
+        LaunchResolutionPath::for_launch(Some(&empty)),
+        LaunchResolutionPath::Resolve
+    );
+    assert_eq!(
+        LaunchResolutionPath::for_launch(Some(&empty)).preresolved(),
+        None
     );
 }
 

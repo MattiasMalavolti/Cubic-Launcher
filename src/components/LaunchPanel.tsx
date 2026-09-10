@@ -5,7 +5,7 @@ import {
   selectedMcVersion, setSelectedMcVersion,
   selectedModLoader, setSelectedModLoader,
   minecraftVersions, mcWithSnapshots, showSnapshots, setShowSnapshots,
-  launchState, launchProgress, activeLaunchStage,
+  launchState, launchProgress, activeLaunchStage, updateCheckRunning,
   launchLogs, logViewerOpen, setLogViewerOpen,
   activeAccount, accounts, setAccountsModalOpen,
 } from "../store";
@@ -289,20 +289,28 @@ export function LaunchPanel(props: LaunchPanelProps) {
             fallback={
               <button
                 onClick={props.onLaunch}
-                disabled={launchState() === "resolving"}
+                disabled={launchState() === "resolving" || updateCheckRunning()}
                 class="px-10 py-3 bg-primary hover:bg-brandPurpleHover text-white font-bold text-lg rounded-lg shadow-lg flex items-center gap-3 transition-colors duration-75 disabled:opacity-70 disabled:cursor-not-allowed"
               >
                 <Show
-                  when={launchState() === "resolving"}
+                  when={updateCheckRunning()}
                   fallback={
-                    <>
-                      <MaterialIcon name="play_arrow" size="lg" />
-                      PLAY
-                    </>
+                    <Show
+                      when={launchState() === "resolving"}
+                      fallback={
+                        <>
+                          <MaterialIcon name="play_arrow" size="lg" />
+                          PLAY
+                        </>
+                      }
+                    >
+                      <Loader2Icon class="h-6 w-6 animate-spin" />
+                      {launchProgress()}%
+                    </Show>
                   }
                 >
                   <Loader2Icon class="h-6 w-6 animate-spin" />
-                  {launchProgress()}%
+                  CHECKING
                 </Show>
               </button>
             }

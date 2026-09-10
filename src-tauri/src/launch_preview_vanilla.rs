@@ -51,16 +51,14 @@ pub(super) async fn run_vanilla_launch_pipeline(
 
     launch_log_session.write_selected_mods(&selected_mods)?;
     launch_log_session.write_dependency_summary(&dependency_resolution)?;
-    launch_log_session.write_resolved_versions(&[], &[])?;
+    launch_log_session.write_resolved_versions(&[], &[], &[])?;
     launch_log_session.write_cache_plan(&acquisition_plan)?;
     launch_log_session.write_final_mod_set(&cached_mod_jars)?;
     launch_log_session.append_summary_line("vanilla_direct_launch=true")?;
     launch_log_session.append_summary_line("excluded_top_level_mods=0")?;
-    launch_log_session.append_summary_line(&format!(
-        "cache_only_mode={}",
-        effective_settings.cache_only_mode
-    ))?;
-    launch_log_session.append_summary_line("cache_only_ignored_for_vanilla=true")?;
+    // No mods means no version resolution and no branch to pick: `summary.log`
+    // says so instead of reporting a setting that no longer decides anything.
+    launch_log_session.append_summary_line("launch_branch=vanilla_no_mods")?;
     launch_log_session.append_summary_line("selected_mods=0")?;
     launch_log_session.append_summary_line("resolved_remote_versions=0")?;
     launch_log_session.append_summary_line("resolved_cached_records=0")?;
