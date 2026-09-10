@@ -661,17 +661,43 @@ pub(super) fn probe_selected_mods(
     Ok(probes)
 }
 
+/// What "the cache can serve this mod" is allowed to mean, per path.
+///
+/// The two paths differ for a measured reason, not for taste. With the jar
+/// gone from the cache directory, restoring it means downloading from
+/// `cdn.modrinth.com`, and a failed download **aborts the whole launch**
+/// (`download_pending_artifacts` propagates, `run_launch_pipeline` returns).
+/// On the resolving path the only situation where the restore matters is one
+/// where Modrinth already failed to answer, so the restore is likely to fail
+/// too: measured, that turned "one mod missing" into "the game does not
+/// start". The path that has a version map is the one that may restore — there
+/// the version is named, the restore is the point (A3b), and the launch has
+/// something to promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CacheBacking {
+    /// The jar is on disk: nothing has to be fetched for this mod.
+    JarOnDisk,
+    /// A registered row is enough; the launch restores the jar from it.
+    RestorableFromRow,
+}
+
 /// The selected mods this machine can install with no help from Modrinth.
 ///
-/// D29, and the single reading of "the cache has it" that both selection
-/// passes use: a row for **this exact target** — the probe keys on
-/// `(project, mc_version, mod_loader)`, never on the project alone — whose jar
-/// is on disk or can be restored from the row itself. A project cached for
-/// another game version is not cached for this one.
-pub(super) fn cache_backed_mods(probes: &[(String, CacheProbe)]) -> HashSet<String> {
+/// D29: a row for **this exact target** — the probe keys on
+/// `(project, mc_version, mod_loader)`, never on the project alone — makes the
+/// mod available whatever Modrinth says. A project cached for another game
+/// version is not cached for this one.
+pub(super) fn cache_backed_mods(
+    probes: &[(String, CacheProbe)],
+    backing: CacheBacking,
+) -> HashSet<String> {
     probes
         .iter()
-        .filter(|(_, probe)| matches!(probe, CacheProbe::Ready(_) | CacheProbe::JarMissing(_)))
+        .filter(|(_, probe)| match probe {
+            CacheProbe::Ready(_) => true,
+            CacheProbe::JarMissing(_) => backing == CacheBacking::RestorableFromRow,
+            CacheProbe::JarMissingUnrecoverable(_) | CacheProbe::NotCached => false,
+        })
         .map(|(mod_id, _)| mod_id.clone())
         .collect()
 }
@@ -683,6 +709,11 @@ pub(super) fn cache_backed_mods(probes: &[(String, CacheProbe)]) -> HashSet<Stri
 /// without this nothing downstream installs it: it would stay in the
 /// resolution and out of the game, which is the failure this repository keeps
 /// paying for.
+///
+/// Only jars that are **on disk** become artifacts here, matching
+/// `CacheBacking::JarOnDisk`: this path installs what it already has and
+/// fetches nothing, so it cannot make the launch depend on a host that just
+/// went silent.
 pub(super) fn cached_artifacts_for_unresolved(
     probes: &[(String, CacheProbe)],
     resolved: &HashMap<String, ModrinthVersion>,
@@ -694,10 +725,9 @@ pub(super) fn cached_artifacts_for_unresolved(
             CacheProbe::Ready(record) => {
                 Some((mod_id.clone(), RemoteArtifact::Cached(record.clone())))
             }
-            CacheProbe::JarMissing(record) => {
-                Some((mod_id.clone(), RemoteArtifact::MissingJar(record.clone())))
-            }
-            CacheProbe::JarMissingUnrecoverable(_) | CacheProbe::NotCached => None,
+            CacheProbe::JarMissing(_)
+            | CacheProbe::JarMissingUnrecoverable(_)
+            | CacheProbe::NotCached => None,
         })
         .collect()
 }
@@ -717,36 +747,32 @@ pub(super) fn resolve_cache_fallback_artifacts(
     let probes = probe_selected_mods(launcher_paths, selected_mods, target)?;
     let fallback = cached_artifacts_for_unresolved(&probes, resolved);
 
-    let mut restored = 0usize;
     for (mod_id, artifact) in &fallback {
         // "No version came back" covers both a Modrinth that has none for this
         // target and a lookup that failed: the resolving pass reports the two
         // the same way, so the log does not claim to tell them apart.
-        let message = match artifact {
-            RemoteArtifact::Cached(record) => format!(
-                "[Cache] no version came back from Modrinth for '{}' on this target; installing the cached jar {} (version {})",
-                mod_id, record.jar_filename, record.modrinth_version_id
-            ),
-            RemoteArtifact::MissingJar(record) => {
-                restored += 1;
-                report_restored_jar(app_handle, mod_id, record);
-                continue;
-            }
-            RemoteArtifact::Live(_) => continue,
-        };
-        let _ = emit_log(app_handle, ProcessLogStream::Stderr, message);
+        if let RemoteArtifact::Cached(record) = artifact {
+            let _ = emit_log(
+                app_handle,
+                ProcessLogStream::Stderr,
+                format!(
+                    "[Cache] no version came back from Modrinth for '{}' on this target; installing the cached jar {} (version {})",
+                    mod_id, record.jar_filename, record.modrinth_version_id
+                ),
+            );
+        }
     }
 
     // One notice for the whole fallback, not one per mod: with Modrinth
     // unreachable this is the entire mod-list, and twenty-five banners say
     // less than one.
-    let from_cache = fallback.len() - restored;
-    if from_cache > 0 {
+    if !fallback.is_empty() {
         let _ = emit_launcher_issue(
             app_handle,
             "Launching from your cached versions",
             &format!(
-                "{from_cache} mod(s) got no version from Modrinth for this target and are installed from the jars you already have."
+                "{} mod(s) got no version from Modrinth for this target and are installed from the jars you already have.",
+                fallback.len()
             ),
             "Modrinth either has no compatible version for them or did not answer. The launch continues with the cached versions.",
             "warning",
@@ -755,8 +781,37 @@ pub(super) fn resolve_cache_fallback_artifacts(
     }
 
     for (mod_id, probe) in &probes {
-        if !resolved.contains_key(mod_id) {
-            report_unusable_probe(app_handle, mod_id, probe);
+        if resolved.contains_key(mod_id) {
+            continue;
+        }
+        match probe {
+            // Nothing to restore it from here: the row's url points at the
+            // host that just failed to answer, and one failed download ends
+            // the launch. The mod is skipped, and said.
+            CacheProbe::JarMissing(record) => {
+                let _ = emit_log(
+                    app_handle,
+                    ProcessLogStream::Stderr,
+                    format!(
+                        "[Cache] the cached jar of '{}' is gone ({}) and no version came back from Modrinth to fetch it with; the mod is skipped",
+                        mod_id, record.jar_filename
+                    ),
+                );
+                let _ = emit_launcher_issue(
+                    app_handle,
+                    "Mod left out of the launch",
+                    &format!(
+                        "The jar of '{mod_id}' is gone from the cache and Modrinth gave no version to fetch it with."
+                    ),
+                    &format!(
+                        "{} (version {}) would have to be downloaded again, and this launch got no answer for it.",
+                        record.jar_filename, record.modrinth_version_id
+                    ),
+                    "warning",
+                    "launch",
+                );
+            }
+            _ => report_unusable_probe(app_handle, mod_id, probe),
         }
     }
 
@@ -1217,7 +1272,14 @@ pub(super) async fn resolve_online_selection(
     // available whatever Modrinth says, or fails to say. Without it a version
     // Modrinth has dropped, or a Modrinth that does not answer, empties the
     // mod-list — measured on this repository: 25 selected mods down to 1.
-    let cache_backed = cache_backed_mods(&probe_selected_mods(launcher_paths, &selected, target)?);
+    //
+    // `JarOnDisk` and not `RestorableFromRow`: see `CacheBacking`. Restoring
+    // here would make the launch depend on the host that just went silent, and
+    // a failed download ends the launch instead of costing one mod — measured.
+    let cache_backed = cache_backed_mods(
+        &probe_selected_mods(launcher_paths, &selected, target)?,
+        CacheBacking::JarOnDisk,
+    );
     let unavailable = unavailable_selected_mods(&selected, |mod_id| {
         versions.contains_key(mod_id)
             || cache_backed.contains(mod_id)
@@ -1253,7 +1315,10 @@ pub(super) fn resolve_offline_selection(
 ) -> Result<TargetSelection> {
     let resolution = resolve_modlist(modlist, target)?;
     let selected = collect_selected_mods(modlist, &resolution, target);
-    let cache_backed = cache_backed_mods(&probe_selected_mods(launcher_paths, &selected, target)?);
+    let cache_backed = cache_backed_mods(
+        &probe_selected_mods(launcher_paths, &selected, target)?,
+        CacheBacking::RestorableFromRow,
+    );
     let unavailable = unavailable_selected_mods(&selected, |mod_id| {
         cache_backed.contains(mod_id)
             || preresolved.is_some_and(|preresolved| preresolved.contains_key(mod_id))
@@ -1816,8 +1881,6 @@ mod tests {
                 "sodium".to_string(),
                 CacheProbe::Ready(cached_record("sodium-v1", "sodium-0.5.8.jar")),
             ),
-            // A jar that left the cache directory still counts: the launch
-            // restores it from the row, so the mod is not disabled.
             (
                 "iris".to_string(),
                 CacheProbe::JarMissing(cached_record("iris-v1", "iris-1.7.jar")),
@@ -1829,15 +1892,23 @@ mod tests {
             ("polytone".to_string(), CacheProbe::NotCached),
         ];
 
-        let backed = cache_backed_mods(&probes);
-
-        assert!(backed.contains("sodium"));
-        assert!(backed.contains("iris"));
+        // The path with a version map may restore a jar that left the cache:
+        // the version is named and the restore is the point.
+        let restorable = cache_backed_mods(&probes, CacheBacking::RestorableFromRow);
+        assert!(restorable.contains("sodium"));
+        assert!(restorable.contains("iris"));
         // Nothing can produce a jar for these two, so availability must not
         // keep them: a mod kept without a jar is a mod missing in silence.
-        assert!(!backed.contains("lithium"));
-        assert!(!backed.contains("polytone"));
-        assert_eq!(backed.len(), 2);
+        assert!(!restorable.contains("lithium"));
+        assert!(!restorable.contains("polytone"));
+        assert_eq!(restorable.len(), 2);
+
+        // The resolving path may not: restoring means downloading from the
+        // host that just gave no answer, and one failed download ends the
+        // launch. Measured: with the cdn blocked that turned a missing mod
+        // into a launch that never started.
+        let on_disk = cache_backed_mods(&probes, CacheBacking::JarOnDisk);
+        assert_eq!(on_disk, HashSet::from(["sodium".to_string()]));
     }
 
     #[test]
@@ -1861,19 +1932,19 @@ mod tests {
 
         let fallback = cached_artifacts_for_unresolved(&probes, &resolved);
 
-        // `iris` resolved: adding its cached row here would put two version
-        // ids in the plan for one mod and let the launch install the older
-        // one, which is the drift this whole feature exists to stop.
+        // `sodium` only. `iris` resolved: adding its cached row would put two
+        // version ids in the plan for one mod and let the launch install the
+        // older one, the drift this feature exists to stop. `modernfix` has
+        // lost its jar: fetching it back is exactly the request that fails
+        // when Modrinth is the thing that went quiet, and a failed download
+        // ends the launch.
         assert_eq!(
             fallback
                 .iter()
                 .map(|(mod_id, _)| mod_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["sodium", "modernfix"]
+            vec!["sodium"]
         );
         assert!(matches!(&fallback[0].1, RemoteArtifact::Cached(record) if record == &sodium));
-        assert!(
-            matches!(&fallback[1].1, RemoteArtifact::MissingJar(record) if record == &modernfix)
-        );
     }
 }

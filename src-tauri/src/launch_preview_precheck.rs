@@ -168,9 +168,11 @@ pub(super) fn build_precheck_result(
             continue;
         }
 
-        // No candidate means no compatible version on Modrinth at all. The
-        // launch skips such a mod today, so the pre-check has nothing to
-        // promise about it either.
+        // No candidate means no compatible version on Modrinth at all. Such a
+        // mod is not dropped any more — a jar in the cache for this target
+        // keeps it (D29, both selection passes) — but the pre-check has no
+        // version to promise for it: the cache is what decides, and the launch
+        // acquires it from the row without a map entry.
         let Some(candidate) = candidates.get(&selected.mod_id) else {
             continue;
         };

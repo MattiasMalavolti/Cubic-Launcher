@@ -52,7 +52,7 @@ export function NoticeBanner() {
           </For>
           <div class="flex items-center gap-3 pl-7">
             <Show when={hiddenCount() > 0}>
-              <p class="text-xs text-textMuted">{hiddenCount()} more notice(s) from this launch</p>
+              <p class="text-xs text-textMuted">{hiddenCount()} more notice(s)</p>
             </Show>
             <Show when={launcherErrors().length > 1}>
               <button
