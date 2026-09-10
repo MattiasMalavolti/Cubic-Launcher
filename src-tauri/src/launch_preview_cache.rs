@@ -4,20 +4,17 @@
 //
 // A launch that resolves versions online and one that launches from a version
 // map must end up with the same final JAR set when the artifacts are already
-// here. Be careful with dependency persistence: launches that resolve refresh
-// dependency rows for resolved parents, so a launch without a resolution pass
-// does not reuse stale dependencies from another Minecraft version or loader.
+// here.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use sha1::{Digest, Sha1};
 use tokio::io::AsyncWriteExt;
 
-use crate::dependencies::{DependencyLink, DependencyRequest, DependencySelector};
 use crate::instance_mods::CachedModJar;
 use crate::launcher_paths::LauncherPaths;
 use crate::mod_cache::{
@@ -196,58 +193,6 @@ pub(super) fn load_cached_version_ids_for_selected(
     load_cached_column_for_selected(launcher_paths, selected_mods, |repository, mod_id| {
         repository.find_cached_version_id_by_project_or_alias(mod_id, target)
     })
-}
-
-pub(super) fn load_cached_dependency_requests(
-    launcher_paths: &LauncherPaths,
-    parent_mod_ids: &[String],
-) -> Result<Vec<DependencyRequest>> {
-    if parent_mod_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
-        format!(
-            "failed to open launcher database at {}",
-            launcher_paths.database_path().display()
-        )
-    })?;
-
-    let mut requests = Vec::new();
-    let mut statement = connection.prepare(
-        r#"
-        SELECT dependency_id, specific_version
-        FROM dependencies
-        WHERE mod_parent_id = ?1
-          AND dep_type = 'required'
-        ORDER BY dependency_id ASC
-        "#,
-    )?;
-
-    for parent_mod_id in parent_mod_ids {
-        let rows = statement.query_map([parent_mod_id.as_str()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?;
-
-        for row in rows {
-            let (dependency_id, specific_version) = row?;
-            let selector = match specific_version {
-                Some(version_id) if !version_id.trim().is_empty() => {
-                    DependencySelector::VersionId { version_id }
-                }
-                _ => DependencySelector::ProjectId {
-                    project_id: dependency_id.clone(),
-                },
-            };
-
-            requests.push(DependencyRequest {
-                parent_mod_id: parent_mod_id.clone(),
-                selector,
-            });
-        }
-    }
-
-    Ok(requests)
 }
 
 /// The acquisition plan of every launch.
@@ -547,11 +492,10 @@ pub(super) async fn download_file(
     Ok(())
 }
 
-pub(super) fn persist_remote_versions_and_dependencies(
+pub(super) fn persist_remote_versions_and_aliases(
     launcher_paths: &LauncherPaths,
     versions: &[ModrinthVersion],
     target: &ResolutionTarget,
-    dependency_links: &[DependencyLink],
     project_aliases: &[(String, String)],
 ) -> Result<()> {
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
@@ -570,52 +514,6 @@ pub(super) fn persist_remote_versions_and_dependencies(
         repository.upsert_project_alias(alias, canonical_project_id)?;
     }
 
-    let refreshed_parent_ids = versions
-        .iter()
-        .map(|version| version.project_id.clone())
-        .collect::<HashSet<_>>();
-    persist_dependency_links(&connection, dependency_links, &refreshed_parent_ids)
-}
-
-pub(super) fn persist_dependency_links(
-    connection: &Connection,
-    links: &[DependencyLink],
-    refreshed_parent_ids: &HashSet<String>,
-) -> Result<()> {
-    let transaction = connection.unchecked_transaction()?;
-
-    for parent_id in refreshed_parent_ids {
-        transaction.execute(
-            "DELETE FROM dependencies WHERE mod_parent_id = ?1",
-            [parent_id.as_str()],
-        )?;
-    }
-
-    for link in links {
-        transaction.execute(
-            r#"
-            INSERT INTO dependencies (
-                mod_parent_id,
-                dependency_id,
-                dep_type,
-                specific_version,
-                jar_filename
-            ) VALUES (?1, ?2, 'required', ?3, ?4)
-            ON CONFLICT(mod_parent_id, dependency_id) DO UPDATE SET
-                dep_type = excluded.dep_type,
-                specific_version = excluded.specific_version,
-                jar_filename = excluded.jar_filename
-            "#,
-            params![
-                &link.parent_mod_id,
-                &link.dependency_id,
-                &link.specific_version,
-                &link.jar_filename,
-            ],
-        )?;
-    }
-
-    transaction.commit()?;
     Ok(())
 }
 

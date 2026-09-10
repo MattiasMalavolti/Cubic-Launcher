@@ -1,27 +1,26 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::app_shell::{ShellGlobalSettings, ShellModListOverrides};
-use crate::dependencies::DependencyLink;
-use crate::modrinth::{DependencyType, ModrinthDependency, ModrinthFile, ModrinthVersion};
+use crate::modrinth::{ModrinthFile, ModrinthVersion};
 use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
     automation_exit_code, build_instance_root, build_modded_classpath_entries,
-    build_top_level_owner_map, contained_loader_library_path, detect_modrinth_declared_notices,
-    embedded_min_java_requirement, fabric_dependency_predicates_match, fabric_issue_to_notice,
+    contained_loader_library_path,
+    embedded_min_java_requirement, fabric_dependency_predicates_match,
     filter_minecraft_launch_game_arguments, forge_wrapper_installer_artifact,
     load_active_account_for_launch_with_diagnostics, load_modlist, local_mod_jar_path,
     maven_artifact_relative_path,
     merge_minecraft_and_loader_game_arguments, merge_minecraft_and_loader_jvm_arguments,
     minecraft_version_predicate_matches, minimum_java_version_for_predicate, parse_mod_loader,
     relative_loader_library_path, substitute_known_placeholders, validate_content_filename,
-    validate_final_fabric_runtime, DependencyNoticeKind, EffectiveLaunchSettings,
-    EmbeddedFabricModMetadata, EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
-    FabricValidationIssue, LaunchPlaceholders, LaunchRequest, LaunchResolutionPath,
+    EffectiveLaunchSettings,
+    EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
+    LaunchPlaceholders, LaunchRequest, LaunchResolutionPath,
     LaunchVerificationRequest,
     LaunchVerificationResult,
-    OwnedEmbeddedFabricModMetadata, PlayerIdentity,
+    PlayerIdentity,
 };
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
 
@@ -627,23 +626,6 @@ fn sample_version(project_id: &str, version_id: &str) -> ModrinthVersion {
     }
 }
 
-fn metadata_entry(
-    owner_project_id: &str,
-    mod_id: &str,
-    version: &str,
-) -> OwnedEmbeddedFabricModMetadata {
-    OwnedEmbeddedFabricModMetadata {
-        owner_project_id: owner_project_id.into(),
-        metadata: EmbeddedFabricModMetadata {
-            mod_id: mod_id.into(),
-            version: version.into(),
-            provides: Vec::new(),
-            depends: HashMap::new(),
-            breaks: HashMap::new(),
-        },
-    }
-}
-
 #[test]
 fn java_predicates_extract_minimum_requirement() {
     assert_eq!(minimum_java_version_for_predicate(">=22"), Some(22));
@@ -696,120 +678,6 @@ fn fabric_dependency_predicates_match_semver_ranges() {
         &[">=1.8.0".into()],
         "1.8.0-beta.4+mc1.21.1"
     ));
-}
-
-#[test]
-fn owner_map_propagates_transitive_dependency_owners() {
-    let parent_versions = vec![sample_version("top-level", "top-level-1")];
-    let owner_map = build_top_level_owner_map(
-        &parent_versions,
-        &[
-            DependencyLink {
-                parent_mod_id: "top-level".into(),
-                dependency_id: "mid".into(),
-                specific_version: None,
-                jar_filename: "mid.jar".into(),
-            },
-            DependencyLink {
-                parent_mod_id: "mid".into(),
-                dependency_id: "leaf".into(),
-                specific_version: None,
-                jar_filename: "leaf.jar".into(),
-            },
-        ],
-    );
-
-    assert_eq!(
-        owner_map.get("leaf"),
-        Some(&HashSet::from(["top-level".to_string()]))
-    );
-}
-
-#[test]
-fn final_fabric_validation_excludes_top_level_on_breaks_conflict() {
-    let owner_map = HashMap::from([(
-        "puzzle-project".to_string(),
-        HashSet::from(["puzzle-project".to_string()]),
-    )]);
-    let mut puzzle = metadata_entry("puzzle-project", "puzzle", "2.3.0");
-    puzzle
-        .metadata
-        .breaks
-        .insert("entity_model_features".into(), vec!["<3.0.0".into()]);
-    let emf = metadata_entry("emf-project", "entity_model_features", "2.4.1");
-
-    let issues = validate_final_fabric_runtime(&[puzzle, emf], &owner_map);
-
-    assert_eq!(
-        issues.get("puzzle-project").map(|issue| issue.reason_code),
-        Some("breaks_conflict")
-    );
-}
-
-#[test]
-fn final_fabric_validation_excludes_top_level_on_prerelease_breaks_conflict() {
-    let owner_map = HashMap::from([
-        (
-            "sodium-project".to_string(),
-            HashSet::from(["sodium-project".to_string()]),
-        ),
-        (
-            "reeses-project".to_string(),
-            HashSet::from(["sodiumoptionsapi-project".to_string()]),
-        ),
-    ]);
-    let mut sodium = metadata_entry("sodium-project", "sodium", "0.6.13+mc1.21.1");
-    sodium
-        .metadata
-        .breaks
-        .insert("reeses-sodium-options".into(), vec!["<1.8.0".into()]);
-    let reeses = metadata_entry(
-        "reeses-project",
-        "reeses-sodium-options",
-        "1.8.0-beta.4+mc1.21.1",
-    );
-
-    let issues = validate_final_fabric_runtime(&[sodium, reeses], &owner_map);
-
-    assert_eq!(
-        issues.get("sodium-project").map(|issue| issue.reason_code),
-        Some("breaks_conflict")
-    );
-}
-
-#[test]
-fn final_fabric_validation_excludes_top_level_on_missing_dependency() {
-    let owner_map = HashMap::from([
-        (
-            "sodiumoptionsapi-project".to_string(),
-            HashSet::from(["sodiumoptionsapi-project".to_string()]),
-        ),
-        (
-            "embedded-helper-project".to_string(),
-            HashSet::from(["sodiumoptionsapi-project".to_string()]),
-        ),
-    ]);
-    let mut sodium_options_api =
-        metadata_entry("sodiumoptionsapi-project", "sodiumoptionsapi", "1.0.10");
-    sodium_options_api
-        .metadata
-        .depends
-        .insert("reeses-sodium-options".into(), vec!["*".into()]);
-
-    let issues = validate_final_fabric_runtime(&[sodium_options_api], &owner_map);
-
-    assert_eq!(
-        issues
-            .get("sodiumoptionsapi-project")
-            .and_then(|issue| issue.dependency_id.as_deref()),
-        Some("reeses-sodium-options")
-    );
-    assert_eq!(
-        issues
-            .get("sodiumoptionsapi-project")
-            .map(|issue| issue.reason_code),
-        Some("missing_dependency")
-    );
 }
 
 // ── Automation entry-point (env → full verification) ────────────────────────
@@ -939,129 +807,5 @@ fn a_launch_request_without_a_version_map_is_the_request_of_today() {
     assert_eq!(
         with_map.resolved_versions,
         Some(HashMap::from([("sodium".to_string(), "abc123".to_string())]))
-    );
-}
-
-// ── Informational dependency detection (no auto-management) ──────────────────
-
-fn version_with_required_dep(
-    project_id: &str,
-    version_id: &str,
-    dep_project: &str,
-    dep_version_id: Option<&str>,
-) -> ModrinthVersion {
-    let mut v = sample_version(project_id, version_id);
-    v.dependencies.push(ModrinthDependency {
-        version_id: dep_version_id.map(|s| s.to_string()),
-        project_id: Some(dep_project.to_string()),
-        dependency_type: DependencyType::Required,
-        file_name: None,
-    });
-    v
-}
-
-#[test]
-fn iris_pinned_dep_produces_notice_without_excluding_or_downloading() {
-    // Iris (YL57xq9U) requires sodium (AANobbMI) pinned to version_id vf7UgZpC
-    // (sodium 0.9.1, not tagged for 26.1). The mod-list has sodium 0.8.9
-    // (version id 'sodium-0.8.9') top-level. Under the new design: Iris is NOT
-    // excluded, the pin is NOT downloaded — a single informational notice is
-    // produced reporting the version mismatch.
-    let iris = version_with_required_dep("YL57xq9U", "iris-1.11.2", "AANobbMI", Some("vf7UgZpC"));
-    let sodium = sample_version("AANobbMI", "sodium-0.8.9");
-    let parent_versions = vec![iris.clone(), sodium.clone()];
-    let selected: std::collections::HashMap<String, ModrinthVersion> = parent_versions
-        .iter()
-        .map(|v| (v.project_id.clone(), v.clone()))
-        .collect();
-    let mut pin_labels = std::collections::HashMap::new();
-    pin_labels.insert("vf7UgZpC".to_string(), "0.9.1".to_string());
-
-    let notices = detect_modrinth_declared_notices(&parent_versions, &selected, &pin_labels);
-
-    assert_eq!(notices.len(), 1, "exactly one notice for the pin mismatch");
-    let notice = &notices[0];
-    assert_eq!(notice.requiring_project_id, "YL57xq9U");
-    assert_eq!(notice.dependency_id, "AANobbMI");
-    assert_eq!(notice.kind, DependencyNoticeKind::VersionUnsatisfied);
-    assert!(
-        notice.detail.contains("0.9.1"),
-        "reports the declared version"
-    );
-    // Both mods remain selectable — detection never mutates the selection.
-    assert!(selected.contains_key("YL57xq9U") && selected.contains_key("AANobbMI"));
-}
-
-#[test]
-fn missing_declared_dependency_produces_missing_notice() {
-    // A parent requires a project that is NOT in the mod-list at all.
-    let parent = version_with_required_dep("parent", "parent-1", "absent-dep", None);
-    let parent_versions = vec![parent.clone()];
-    let selected: std::collections::HashMap<String, ModrinthVersion> = parent_versions
-        .iter()
-        .map(|v| (v.project_id.clone(), v.clone()))
-        .collect();
-
-    let notices = detect_modrinth_declared_notices(
-        &parent_versions,
-        &selected,
-        &std::collections::HashMap::new(),
-    );
-
-    assert_eq!(notices.len(), 1);
-    assert_eq!(notices[0].kind, DependencyNoticeKind::Missing);
-    assert_eq!(notices[0].dependency_id, "absent-dep");
-}
-
-#[test]
-fn satisfied_declared_dependency_produces_no_notice() {
-    // Parent requires sodium project with NO pin; sodium is present. No notice.
-    let parent = version_with_required_dep("parent", "parent-1", "AANobbMI", None);
-    let sodium = sample_version("AANobbMI", "sodium-0.8.9");
-    let parent_versions = vec![parent, sodium];
-    let selected: std::collections::HashMap<String, ModrinthVersion> = parent_versions
-        .iter()
-        .map(|v| (v.project_id.clone(), v.clone()))
-        .collect();
-
-    let notices = detect_modrinth_declared_notices(
-        &parent_versions,
-        &selected,
-        &std::collections::HashMap::new(),
-    );
-    assert!(
-        notices.is_empty(),
-        "present unpinned dependency yields no notice"
-    );
-}
-
-#[test]
-fn rso_embedded_incompatible_version_maps_to_version_unsatisfied_notice() {
-    // RSO (Bh37bMuy) embedded fabric.mod.json requires sodium >=0.9.1 while
-    // sodium 0.8.9 is present -> the predicate-aware validator yields an
-    // incompatible_dependency_version issue, which becomes a
-    // "present but older" VersionUnsatisfied notice.
-    let issue = FabricValidationIssue {
-        reason_code: "incompatible_dependency_version",
-        owner_project_id: "Bh37bMuy".into(),
-        mod_id: "reeses_sodium_options".into(),
-        dependency_id: Some("sodium".into()),
-        detail: "embedded metadata requires 'sodium' with a compatible version, but only incompatible versions are present".into(),
-    };
-    let notice = fabric_issue_to_notice("Bh37bMuy", &issue);
-    assert_eq!(notice.kind, DependencyNoticeKind::VersionUnsatisfied);
-    assert_eq!(notice.requiring_project_id, "Bh37bMuy");
-    assert_eq!(notice.dependency_id, "sodium");
-
-    let missing = FabricValidationIssue {
-        reason_code: "missing_dependency",
-        owner_project_id: "Bh37bMuy".into(),
-        mod_id: "reeses_sodium_options".into(),
-        dependency_id: Some("sodium".into()),
-        detail: "embedded metadata requires 'sodium', which is missing".into(),
-    };
-    assert_eq!(
-        fabric_issue_to_notice("Bh37bMuy", &missing).kind,
-        DependencyNoticeKind::Missing
     );
 }

@@ -17,7 +17,7 @@ Build, maintain, and launch rule-driven Minecraft modlists with explicit choices
 
 ## Dependency philosophy
 
-**You manage dependencies.** When you add any mod—including a dependency another mod needs—the launcher always selects the latest release tagged for the exact Minecraft version in play. Declared dependency requirements appear as informational notices; Cubic Launcher never auto-downloads dependencies behind your back and never auto-excludes mods.
+**You manage dependencies.** When you add any mod—including a dependency another mod needs—the launcher always selects the latest release tagged for the exact Minecraft version in play. Cubic Launcher never inspects what a mod declares it needs, never auto-downloads dependencies behind your back, and never auto-excludes mods. If a dependency really is missing, the Minecraft client says so at startup.
 
 - Deterministic, user-controlled modlists.
 - No hidden downloads or surprise version drift.
