@@ -2,11 +2,11 @@
 
 // Cache and artifact helpers for the launch pipeline.
 //
-// Cache-only mode depends on this module producing the same final JAR set as
-// an online launch when artifacts are already present locally. Be careful with
-// dependency persistence: online launches refresh dependency rows for resolved
-// parents so cache-only launches do not reuse stale dependencies from another
-// Minecraft version or loader.
+// A launch that resolves versions online and one that launches from a version
+// map must end up with the same final JAR set when the artifacts are already
+// here. Be careful with dependency persistence: launches that resolve refresh
+// dependency rows for resolved parents, so a launch without a resolution pass
+// does not reuse stale dependencies from another Minecraft version or loader.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,9 +21,9 @@ use crate::dependencies::{DependencyLink, DependencyRequest, DependencySelector}
 use crate::instance_mods::CachedModJar;
 use crate::launcher_paths::LauncherPaths;
 use crate::mod_cache::{
-    build_mod_acquisition_plan, cache_record_from_version, cached_artifact_path_for_record,
-    cached_local_artifact_path, pending_download_from_record, pending_download_from_version,
-    CacheProbe, ModAcquisitionPlan, ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
+    cache_record_from_version, cached_artifact_path_for_record, cached_local_artifact_path,
+    pending_download_from_record, pending_download_from_version, CacheProbe, ModAcquisitionPlan,
+    ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
 };
 use crate::modrinth::ModrinthVersion;
 use crate::process_streaming::ProcessLogStream;
@@ -250,12 +250,13 @@ pub(super) fn load_cached_dependency_requests(
     Ok(requests)
 }
 
-/// The cache-only acquisition plan.
+/// The acquisition plan of every launch.
 ///
 /// Three inputs, one per kind of artifact the selection pass produced: live
 /// versions (a version the cache does not hold, whose metadata came from
 /// Modrinth), records with their jar in place, and records whose jar is gone
 /// and that the download stage has to restore **at the registered version**.
+/// A launch that resolved everything online passes two empty lists.
 pub(super) fn build_remote_acquisition_plan_from_artifacts(
     launcher_paths: &LauncherPaths,
     live_versions: &[ModrinthVersion],
@@ -302,22 +303,6 @@ pub(super) fn build_remote_acquisition_plan_from_artifacts(
         cached,
         to_download,
     })
-}
-
-pub(super) fn build_remote_acquisition_plan(
-    launcher_paths: &LauncherPaths,
-    versions: &[ModrinthVersion],
-    target: &ResolutionTarget,
-) -> Result<crate::mod_cache::ModAcquisitionPlan> {
-    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
-        format!(
-            "failed to open launcher database at {}",
-            launcher_paths.database_path().display()
-        )
-    })?;
-    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
-
-    build_mod_acquisition_plan(versions, target, &repository)
 }
 
 pub(super) async fn download_pending_artifacts(

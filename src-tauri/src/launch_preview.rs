@@ -284,7 +284,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     let preresolved_versions = resolution_path.preresolved();
     let selection = match resolution_path {
         LaunchResolutionPath::Preresolved(preresolved) => {
-            resolve_cache_only_selection(&launcher_paths, &modlist, &target, Some(preresolved))?
+            resolve_offline_selection(&launcher_paths, &modlist, &target, Some(preresolved))?
         }
         LaunchResolutionPath::Resolve => {
             resolve_online_selection(
@@ -426,6 +426,16 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
                 .await?
             }
         };
+        // The mods no version came back for keep the jar the cache already
+        // holds (D29): the availability pass kept them, so this is where they
+        // are actually acquired.
+        let fallback = resolve_cache_fallback_artifacts(
+            &app_handle,
+            &launcher_paths,
+            &selected_mods,
+            &compatible_versions,
+            &target,
+        )?;
         let parent_versions = selected_mods
             .iter()
             .filter(|selected| matches!(selected.source, ModSource::Modrinth))
@@ -459,8 +469,8 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
 
         (
             parent_versions,
-            Vec::new(),
-            Vec::new(),
+            fallback.cached_records,
+            fallback.missing_jar_records,
             DependencyResolution::default(),
             required_java_version_for_minecraft(&target.minecraft_version)?,
             project_aliases,
@@ -497,17 +507,16 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "Inspecting cached mods and downloading missing dependencies.",
     )?;
 
-    let acquisition_plan = if matches!(resolution_path, LaunchResolutionPath::Preresolved(_)) {
-        build_remote_acquisition_plan_from_artifacts(
-            &launcher_paths,
-            &all_remote_versions,
-            &cached_remote_records,
-            &missing_jar_records,
-            &target,
-        )?
-    } else {
-        build_remote_acquisition_plan(&launcher_paths, &all_remote_versions, &target)?
-    };
+    // One builder for both paths: the three lists say what each launch found,
+    // and on the resolving path the two record lists are empty unless the
+    // cache had to answer for a mod Modrinth did not.
+    let acquisition_plan = build_remote_acquisition_plan_from_artifacts(
+        &launcher_paths,
+        &all_remote_versions,
+        &cached_remote_records,
+        &missing_jar_records,
+        &target,
+    )?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
